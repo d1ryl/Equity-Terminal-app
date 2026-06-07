@@ -1,13 +1,10 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<html lang="en"><head>
+<meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Equity Terminal</title>
 <style>html,body{margin:0;background:#0A0F1C;}#root{min-height:100vh;}#boot{color:#7E8CA6;font-family:system-ui;padding:24px;}</style>
 <script>window.addEventListener('error',function(e){var b=document.getElementById('boot');if(b){b.style.color='#E5564E';b.textContent='Error: '+(e.message||e.error);}});</script>
-</head>
-<body>
+</head><body>
 <div id="root"><div id="boot">Loading Equity Terminal…</div></div>
 <script>/**
  * @license React
@@ -330,7 +327,8 @@ const {
   BarChart,
   Bar,
   Cell,
-  ComposedChart
+  ComposedChart,
+  Scatter
 } = Recharts;
 const SvgI = ({
   size = 18,
@@ -518,33 +516,33 @@ function pivotPoints(b) {
   };
 }
 function swingLevels(data, k = 4) {
-  const highs = [],
-    lows = [];
+  const cur = data[data.length - 1].close;
+  const pts = [];
   for (let i = k; i < data.length - k; i++) {
     const win = data.slice(i - k, i + k + 1);
-    if (data[i].high === Math.max(...win.map(b => b.high))) highs.push(data[i].high);
-    if (data[i].low === Math.min(...win.map(b => b.low))) lows.push(data[i].low);
+    if (data[i].high === Math.max(...win.map(b => b.high))) pts.push(data[i].high);
+    if (data[i].low === Math.min(...win.map(b => b.low))) pts.push(data[i].low);
   }
-  const cluster = arr => {
-    const sorted = [...arr].sort((a, b) => a - b);
-    const out = [];
-    for (const v of sorted) {
-      const last = out[out.length - 1];
-      if (last && Math.abs(v - last.avg) / last.avg < 0.01) {
-        last.n += 1;
-        last.sum += v;
-        last.avg = last.sum / last.n;
-      } else out.push({
-        avg: v,
-        sum: v,
-        n: 1
-      });
-    }
-    return out.sort((a, b) => b.n - a.n).slice(0, 3).map(o => o.avg);
-  };
+  // cluster nearby swing points (within ~1.2%) into single levels
+  const sorted = [...pts].sort((a, b) => a - b);
+  const clusters = [];
+  for (const v of sorted) {
+    const last = clusters[clusters.length - 1];
+    if (last && Math.abs(v - last.avg) / last.avg < 0.012) {
+      last.n += 1;
+      last.sum += v;
+      last.avg = last.sum / last.n;
+    } else clusters.push({
+      avg: v,
+      sum: v,
+      n: 1
+    });
+  }
+  const levels = clusters.map(c => c.avg);
+  // a level above today's price acts as resistance; below, as support — nearest first
   return {
-    resistance: cluster(highs),
-    support: cluster(lows)
+    resistance: levels.filter(v => v > cur).sort((a, b) => a - b).slice(0, 3),
+    support: levels.filter(v => v < cur).sort((a, b) => b - a).slice(0, 3)
   };
 }
 function fib(data) {
@@ -695,6 +693,123 @@ function obv(data) {
     return o / 1e6;
   });
 }
+
+// ---- buy/sell signals derived from the indicators ----
+function computeSignals(data, ind) {
+  const buys = [],
+    sells = [];
+  // chart markers: MACD line crossing its signal line
+  for (let i = 1; i < data.length; i++) {
+    const d0 = ind.macd.line[i - 1] - ind.macd.signal[i - 1];
+    const d1 = ind.macd.line[i] - ind.macd.signal[i];
+    if (d0 <= 0 && d1 > 0) buys.push(i);
+    if (d0 >= 0 && d1 < 0) sells.push(i);
+  }
+  // current stance across three indicators
+  const n = data.length - 1;
+  const rsiV = ind.rsi[n];
+  const histV = ind.macd.hist[n];
+  const sma = ind.sma20[n],
+    ema = ind.ema50[n];
+  const stance = {
+    RSI: rsiV == null ? "—" : rsiV < 30 ? "Buy" : rsiV > 70 ? "Sell" : "Neutral",
+    MACD: histV == null ? "—" : histV > 0 ? "Buy" : histV < 0 ? "Sell" : "Neutral",
+    "MA cross": sma == null || ema == null ? "—" : sma > ema ? "Buy" : sma < ema ? "Sell" : "Neutral"
+  };
+  const vals = Object.values(stance);
+  return {
+    buys: new Set(buys),
+    sells: new Set(sells),
+    stance,
+    buyN: vals.filter(v => v === "Buy").length,
+    sellN: vals.filter(v => v === "Sell").length
+  };
+}
+
+// ---- backtest the MACD-crossover signals (long-only, in-sample, close-to-close) ----
+function backtest(data, sig) {
+  let pos = false,
+    entry = 0,
+    eq = 1,
+    trades = 0,
+    wins = 0;
+  for (let i = 0; i < data.length; i++) {
+    if (!pos && sig.buys.has(i)) {
+      pos = true;
+      entry = data[i].close;
+    } else if (pos && sig.sells.has(i)) {
+      const r = data[i].close / entry;
+      eq *= r;
+      trades++;
+      if (r > 1) wins++;
+      pos = false;
+    }
+  }
+  if (pos) {
+    const r = data[data.length - 1].close / entry;
+    eq *= r;
+    trades++;
+    if (r > 1) wins++;
+  }
+  const bh = data[data.length - 1].close / data[0].close - 1;
+  return {
+    stratRet: eq - 1,
+    bh,
+    trades,
+    winRate: trades ? wins / trades : 0
+  };
+}
+
+// ---- plain-English synthesis of trend / momentum / valuation ----
+function computeRead(data, ind, dcf) {
+  const n = data.length - 1,
+    price = data[n].close;
+  const sma = ind.sma20[n],
+    ema = ind.ema50[n],
+    rsiV = ind.rsi[n],
+    hist = ind.macd.hist[n];
+  const lines = [];
+  const trend = sma != null && ema != null ? sma > ema ? "up" : "down" : null;
+  lines.push({
+    label: "Trend",
+    tone: trend === "up" ? "pos" : trend === "down" ? "neg" : "neu",
+    text: trend === "up" ? "Price sits above its moving averages (20-day over 50-day) — a short-term uptrend." : trend === "down" ? "Price sits below its moving averages — a short-term downtrend." : "Not enough history for a trend read."
+  });
+  const rstr = rsiV == null ? "" : ` RSI is ${rsiV.toFixed(0)}${rsiV > 70 ? " — overbought/stretched" : rsiV < 30 ? " — oversold/washed-out" : ""}.`;
+  lines.push({
+    label: "Momentum",
+    tone: hist > 0 ? "pos" : hist < 0 ? "neg" : "neu",
+    text: `${hist > 0 ? "MACD momentum is positive (bullish)." : hist < 0 ? "MACD momentum is negative (bearish)." : "MACD momentum is flat."}${rstr}`
+  });
+  const up = dcf.upside;
+  lines.push({
+    label: "Valuation",
+    tone: up > 0.15 ? "pos" : up < -0.15 ? "neg" : "neu",
+    text: dcf.valid ? `Your DCF puts intrinsic value near ${dcf.perShare.toFixed(2)} vs price ${price.toFixed(2)} — ${(up * 100).toFixed(0)}% ${up >= 0 ? "upside" : "downside"} on your assumptions.` : "Set valid DCF assumptions (WACC must exceed terminal growth) for a valuation read."
+  });
+  const tones = lines.map(l => l.tone);
+  const pos = tones.filter(t => t === "pos").length,
+    neg = tones.filter(t => t === "neg").length;
+  let summary;
+  if (pos && neg) summary = "Mixed — the lenses disagree (often momentum vs valuation). That's normal; weigh which matters for your time horizon.";else if (pos > neg) summary = "Signals lean constructive right now — but they're trend-following and can flip quickly.";else if (neg > pos) summary = "Signals lean cautious right now.";else summary = "Largely neutral right now.";
+  return {
+    lines,
+    summary
+  };
+}
+const EXPLAIN = {
+  sma: ["SMA 20", "The 20-day simple moving average — the average close over 20 bars. Price above it = short-term strength; it also acts as a moving support/resistance line."],
+  ema: ["EMA 50", "The 50-day exponential moving average, which weights recent prices more. The 20-over-50 relationship is a common trend gauge."],
+  bb: ["Bollinger Bands", "Bands set 2 standard deviations above/below the 20-day average. Price tends to stay inside; tags of the outer bands flag stretched moves, and narrow bands often precede big moves."],
+  vwap: ["VWAP", "Volume-weighted average price over the window — the average price weighted by how much traded there. Often used as a fair-value benchmark intraday."],
+  rsi: ["RSI", "Relative Strength Index, 0–100 momentum. Above 70 = overbought, below 30 = oversold. Best for spotting stretched conditions, not exact turns."],
+  macd: ["MACD", "The gap between a fast and slow EMA, plus a signal line. Line crossing above signal = bullish cue, below = bearish; the histogram shows momentum strength."],
+  kdj: ["KDJ / Stochastic", "Compares the close to the recent high–low range. Above 80 = overbought, below 20 = oversold; the J line exaggerates the swing."],
+  cci: ["CCI", "Commodity Channel Index — how far price is from its average. Above +100 = strong upside momentum, below −100 = strong downside."],
+  willr: ["Williams %R", "Momentum from 0 to −100. Above −20 = overbought, below −80 = oversold."],
+  atr: ["ATR", "Average True Range — typical bar size, i.e. volatility. No direction; used to size positions and set stop distances."],
+  obv: ["OBV", "On-Balance Volume adds volume on up days, subtracts on down days. Rising OBV confirms a move has volume behind it."]
+};
 
 // ---- multi-stage DCF + CAPM ----
 function runDCF({
@@ -897,7 +1012,7 @@ function App() {
   const [data, setData] = useState(demoSeries());
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState("demo");
-  const [note, setNote] = useState("Ready. Enter a US ticker (e.g. US.NVDA) and tap Fetch for live data.");
+  const [note, setNote] = useState("Ready. Enter a US ticker (e.g. US.NVDA) and tap Fetch for live data + news.");
 
   // indicator UI state
   const [overlays, setOverlays] = useState({
@@ -907,6 +1022,10 @@ function App() {
     vwap: false
   });
   const [osc, setOsc] = useState("rsi");
+  const [period, setPeriod] = useState("1day");
+  const [signalsOn, setSignalsOn] = useState(true);
+  const [newsItems, setNewsItems] = useState([]);
+  const [newsNote, setNewsNote] = useState("");
 
   // DCF
   const [d, setD] = useState({
@@ -928,8 +1047,10 @@ function App() {
   const [fcfMode, setFcfMode] = useState("avg");
   function applyBase(m, hist) {
     if (!hist || !hist.length) return;
-    const vals = hist.map(h => h.free_cash_flow);
-    const v = m === "avg" ? vals.reduce((a, b) => a + b, 0) / vals.length : vals[vals.length - 1];
+    const pick = m === "exsbc" ? h => h.fcf_ex_sbc : h => h.free_cash_flow;
+    const vals = hist.map(pick).filter(x => x != null);
+    if (!vals.length) return;
+    const v = m === "latest" ? vals[vals.length - 1] : vals.reduce((a, b) => a + b, 0) / vals.length;
     setD(prev => ({
       ...prev,
       fcf0: +(v / 1e6).toFixed(0)
@@ -973,6 +1094,9 @@ function App() {
       obv: obv(data)
     };
   }, [data]);
+  const sig = useMemo(() => computeSignals(data, ind), [data, ind]);
+  const read = useMemo(() => computeRead(data, ind, dcf), [data, ind, dcf]);
+  const bt = useMemo(() => backtest(data, sig), [data, sig]);
   const priceData = data.map((b, i) => ({
     date: b.date,
     close: b.close,
@@ -981,13 +1105,15 @@ function App() {
     bbU: ind.bb[i].u,
     bbM: ind.bb[i].m,
     bbL: ind.bb[i].l,
-    vwap: ind.vwap[i]
+    vwap: ind.vwap[i],
+    buy: signalsOn && sig.buys.has(i) ? b.low : null,
+    sell: signalsOn && sig.sells.has(i) ? b.high : null
   }));
-  async function fetchLive() {
+  async function fetchLive(pd = period) {
     setLoading(true);
     setNote("Fetching…");
     try {
-      const r = await fetch(`${backend}/api/candles?code=${encodeURIComponent(code)}&count=120`);
+      const r = await fetch(`${backend}/api/candles?code=${encodeURIComponent(code)}&count=120&period=${pd}`);
       const j = await r.json();
       if (!j.bars || !j.bars.length) throw new Error(j.detail || "no candles returned");
       setData(j.bars);
@@ -1006,10 +1132,20 @@ function App() {
         if (f.history && f.history.length) {
           setFcfHist(f.history);
           applyBase(fcfMode, f.history);
-          extra = ` · FCF (${fcfMode === "avg" ? "3-yr avg" : "FY" + f.fiscal_year}) from SEC EDGAR`;
+          extra = ` · FCF (${fcfMode === "avg" ? "3-yr avg" : fcfMode === "exsbc" ? "ex-SBC" : "FY" + f.fiscal_year}) from SEC EDGAR`;
         }
       } catch (_) {}
-      setNote(`Live · ${j.count} bars for ${code}.${extra}`);
+      try {
+        const nw = await (await fetch(`${backend}/api/news?code=${encodeURIComponent(code)}&limit=15`)).json();
+        if (nw.news) {
+          setNewsItems(nw.news);
+          setNewsNote(nw.news.length ? "" : "No recent news found.");
+        }
+      } catch (_) {
+        setNewsItems([]);
+        setNewsNote("News needs FINNHUB_KEY set on the backend.");
+      }
+      setNote(`Live · ${j.count} ${pd} bars for ${code}.${extra}`);
     } catch (e) {
       setStatus("error");
       const httpsPage = typeof window !== "undefined" && window.location.protocol === "https:";
@@ -1340,7 +1476,7 @@ function App() {
     }
   }, status)), /*#__PURE__*/React.createElement("input", {
     value: code,
-    onChange: e => setCode(e.target.value),
+    onChange: e => setCode(e.target.value.toUpperCase()),
     placeholder: "US.NVDA",
     style: {
       ...inputStyle,
@@ -1357,7 +1493,7 @@ function App() {
       fontSize: 12
     }
   }), /*#__PURE__*/React.createElement("button", {
-    onClick: fetchLive,
+    onClick: () => fetchLive(),
     disabled: loading,
     style: {
       background: c.gold,
@@ -1401,7 +1537,7 @@ function App() {
       gap: 4,
       padding: "16px 22px 0"
     }
-  }, [["tech", "Technical (S/R + indicators)"], ["val", "Valuation (DCF)"]].map(([k, lbl]) => /*#__PURE__*/React.createElement("button", {
+  }, [["tech", "Technical (S/R + indicators)"], ["val", "Valuation (DCF)"], ["news", "News"]].map(([k, lbl]) => /*#__PURE__*/React.createElement("button", {
     key: k,
     onClick: () => setTab(k),
     style: {
@@ -1441,13 +1577,147 @@ function App() {
       fontFamily: serif,
       fontSize: 18
     }
-  }, code, " \u2014 last ", fmt(last.close, 2)), /*#__PURE__*/React.createElement("div", {
+  }, code.toUpperCase(), " \u2014 last ", fmt(last.close, 2)), /*#__PURE__*/React.createElement("div", {
     style: {
       color: c.mut,
       fontSize: 12,
       fontFamily: mono
     }
-  }, data.length, " sessions")), /*#__PURE__*/React.createElement("div", {
+  }, data.length, " bars")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      flexWrap: "wrap",
+      marginBottom: 10,
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: c.mut,
+      textTransform: "uppercase",
+      letterSpacing: ".08em",
+      marginRight: 2
+    }
+  }, "Timeframe"), [["1h", "1H"], ["4h", "4H"], ["1day", "1D"], ["1week", "1W"]].map(([p, l]) => /*#__PURE__*/React.createElement("button", {
+    key: p,
+    onClick: () => {
+      setPeriod(p);
+      fetchLive(p);
+    },
+    style: {
+      ...segBtn(period === p),
+      flex: "none",
+      padding: "5px 12px",
+      borderRadius: 20
+    }
+  }, l)), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: c.mut,
+      marginLeft: 4
+    }
+  }, "(intraday needs Twelve Data)")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 10,
+      flexWrap: "wrap",
+      alignItems: "center",
+      marginBottom: 10,
+      padding: "8px 10px",
+      background: c.panel2,
+      border: `1px solid ${c.line}`,
+      borderRadius: 8
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setSignalsOn(!signalsOn),
+    style: chip(signalsOn)
+  }, "Signals ", signalsOn ? "on" : "off"), Object.entries(sig.stance).map(([k, v]) => /*#__PURE__*/React.createElement("span", {
+    key: k,
+    style: {
+      fontSize: 12,
+      fontFamily: mono,
+      color: c.mut
+    }
+  }, k, " ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: v === "Buy" ? c.green : v === "Sell" ? c.red : c.mut,
+      fontWeight: 600
+    }
+  }, v))), /*#__PURE__*/React.createElement("span", {
+    style: {
+      marginLeft: "auto",
+      fontFamily: mono,
+      fontSize: 12
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: c.green
+    }
+  }, sig.buyN, " buy"), " \xB7 ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: c.red
+    }
+  }, sig.sellN, " sell"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 12,
+      padding: "12px 14px",
+      background: c.panel2,
+      border: `1px solid ${c.line}`,
+      borderRadius: 8
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: serif,
+      fontSize: 15,
+      marginBottom: 8
+    }
+  }, "The read ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: c.mut,
+      fontSize: 11,
+      fontFamily: sans
+    }
+  }, "\xB7 mechanical synthesis, not advice")), read.lines.map((l, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      fontSize: 13,
+      marginBottom: 4,
+      lineHeight: 1.45
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontFamily: mono,
+      color: l.tone === "pos" ? c.green : l.tone === "neg" ? c.red : c.gold,
+      fontWeight: 600
+    }
+  }, l.label, ":"), " ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: c.ink
+    }
+  }, l.text))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      marginTop: 8,
+      color: c.ink,
+      borderTop: `1px solid ${c.line}`,
+      paddingTop: 8
+    }
+  }, /*#__PURE__*/React.createElement("b", null, "Net:"), " ", read.summary), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: c.mut,
+      marginTop: 6
+    }
+  }, "Backtest (MACD signals, in-sample, no fees): strategy ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: bt.stratRet >= 0 ? c.green : c.red
+    }
+  }, pct(bt.stratRet)), " vs buy-and-hold ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: bt.bh >= 0 ? c.green : c.red
+    }
+  }, pct(bt.bh)), " \xB7 ", bt.trades, " trades \xB7 ", pct(bt.winRate, 0), " win rate.")), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 8,
@@ -1574,7 +1844,34 @@ function App() {
     stroke: c.gold,
     strokeWidth: 2,
     dot: false
+  }), /*#__PURE__*/React.createElement(Scatter, {
+    dataKey: "buy",
+    shape: p => p.cx == null || p.payload.buy == null ? null : /*#__PURE__*/React.createElement("path", {
+      d: `M${p.cx},${p.cy + 4} l-5,9 l10,0 Z`,
+      fill: c.green
+    })
+  }), /*#__PURE__*/React.createElement(Scatter, {
+    dataKey: "sell",
+    shape: p => p.cx == null || p.payload.sell == null ? null : /*#__PURE__*/React.createElement("path", {
+      d: `M${p.cx},${p.cy - 4} l-5,-9 l10,0 Z`,
+      fill: c.red
+    })
   })))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: c.mut,
+      marginTop: 6,
+      fontFamily: mono
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: c.green
+    }
+  }, "\u25B2"), " buy / ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: c.red
+    }
+  }, "\u25BC"), " sell mark MACD line/signal crossovers \u2014 mechanical signals, not advice."), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 6,
@@ -1604,6 +1901,36 @@ function App() {
       height: 150
     }
   }, /*#__PURE__*/React.createElement(OscPane, null)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12,
+      padding: "12px 14px",
+      background: c.panel2,
+      border: `1px solid ${c.line}`,
+      borderRadius: 8
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: serif,
+      fontSize: 14,
+      marginBottom: 8
+    }
+  }, "What you're looking at"), [osc !== "none" ? osc : null, ...["sma", "ema", "bb", "vwap"].filter(k => overlays[k])].filter(Boolean).map(k => /*#__PURE__*/React.createElement("div", {
+    key: k,
+    style: {
+      fontSize: 13,
+      marginBottom: 6,
+      lineHeight: 1.45
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: c.gold,
+      fontWeight: 600
+    }
+  }, EXPLAIN[k][0]), " ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: c.mut
+    }
+  }, "\u2014 ", EXPLAIN[k][1])))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 22,
@@ -1767,7 +2094,14 @@ function App() {
       applyBase("avg", fcfHist);
     },
     style: segBtn(fcfMode === "avg")
-  }, "3-yr avg")), /*#__PURE__*/React.createElement("div", {
+  }, "3-yr avg"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      setFcfMode("exsbc");
+      applyBase("exsbc", fcfHist);
+    },
+    style: segBtn(fcfMode === "exsbc"),
+    title: "3-yr average FCF minus stock-based compensation"
+  }, "ex-SBC")), /*#__PURE__*/React.createElement("div", {
     style: {
       fontFamily: mono,
       fontSize: 11,
@@ -1985,8 +2319,90 @@ function App() {
         fontWeight: here ? 600 : 400
       }
     }, r.valid ? fmt(r.perShare, 2) : "—");
-  }))))))))))));
+  })))))))))), tab === "news" && /*#__PURE__*/React.createElement("div", {
+    className: "rise",
+    style: {
+      ...card,
+      borderRadius: "0 10px 10px 10px",
+      padding: 18
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "baseline",
+      marginBottom: 12,
+      flexWrap: "wrap",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontFamily: serif,
+      fontSize: 18
+    }
+  }, code.toUpperCase(), " \u2014 recent news"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: c.mut,
+      fontSize: 12,
+      fontFamily: mono
+    }
+  }, "last ~3 weeks \xB7 Finnhub")), newsItems.length === 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: c.mut,
+      fontSize: 13
+    }
+  }, newsNote || "Hit Fetch to load news for this ticker."), newsItems.map((nws, i) => /*#__PURE__*/React.createElement("a", {
+    key: i,
+    href: nws.url,
+    target: "_blank",
+    rel: "noopener noreferrer",
+    style: {
+      display: "block",
+      textDecoration: "none",
+      borderTop: i ? `1px solid ${c.line}` : "none",
+      padding: "12px 0"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      gap: 12,
+      flexWrap: "wrap"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      minWidth: 220
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: c.ink,
+      fontSize: 14,
+      fontWeight: 600,
+      lineHeight: 1.35
+    }
+  }, nws.headline), nws.summary && /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: c.mut,
+      fontSize: 12.5,
+      marginTop: 4,
+      lineHeight: 1.45
+    }
+  }, (nws.summary || "").slice(0, 220), (nws.summary || "").length > 220 ? "…" : ""), /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: c.gold,
+      fontSize: 11,
+      marginTop: 5,
+      fontFamily: mono
+    }
+  }, nws.source, nws.datetime ? " · " + new Date(nws.datetime * 1000).toLocaleDateString() : ""))))), /*#__PURE__*/React.createElement("p", {
+    style: {
+      color: c.mut,
+      fontSize: 12,
+      marginTop: 14,
+      lineHeight: 1.5
+    }
+  }, "Headlines are pulled live and unfiltered \u2014 treat them as raw inputs, not verified facts, and click through to the source before acting on anything."))));
 }
 ReactDOM.createRoot(document.getElementById('root')).render(/*#__PURE__*/React.createElement(App, null));</script>
-</body>
-</html>
+</body></html>
