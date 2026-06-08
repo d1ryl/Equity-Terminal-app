@@ -515,6 +515,30 @@ function pivotPoints(b) {
     S3: L - 2 * (H - P)
   };
 }
+
+// classic pivots need the PRIOR session's range, not one intraday bar.
+// intraday -> aggregate the prior calendar day; daily -> the prior bar.
+function priorSessionHLC(data) {
+  if (!data || data.length < 2)
+    return data && data.length ? data[data.length - 1] : { high: 0, low: 0, close: 0 };
+  const dayOf = v => String(v == null ? "" : v).slice(0, 10);
+  const lastDay = dayOf(data[data.length - 1].date);
+  let priorDay = null;
+  for (let i = data.length - 1; i >= 0; i--) {
+    const dd = dayOf(data[i].date);
+    if (dd !== lastDay) { priorDay = dd; break; }
+  }
+  if (priorDay == null) {
+    const b = data[data.length - 2];
+    return { high: b.high, low: b.low, close: b.close };
+  }
+  const grp = data.filter(b => dayOf(b.date) === priorDay);
+  return {
+    high: Math.max(...grp.map(b => b.high)),
+    low: Math.min(...grp.map(b => b.low)),
+    close: grp[grp.length - 1].close
+  };
+}
 function swingLevels(data, k = 4) {
   const cur = data[data.length - 1].close;
   const pts = [];
@@ -546,13 +570,35 @@ function swingLevels(data, k = 4) {
   };
 }
 function fib(data) {
-  const hi = Math.max(...data.map(b => b.high)),
-    lo = Math.min(...data.map(b => b.low));
-  const span = hi - lo;
-  return [0.236, 0.382, 0.5, 0.618, 0.786].map(r => ({
-    label: `${(r * 100).toFixed(1)}%`,
-    value: hi - span * r
-  }));
+  const n = data.length;
+  if (!n) return [];
+  // auto-anchor to the most recent swing (recent window), not the all-time range
+  const W = Math.max(30, Math.min(n, Math.round(n * 0.2)));
+  const win = data.slice(n - W);
+  let H = -Infinity, L = Infinity, ih = 0, il = 0;
+  win.forEach((b, i) => {
+    if (b.high > H) { H = b.high; ih = i; }
+    if (b.low < L) { L = b.low; il = i; }
+  });
+  const span = (H - L) || 1;
+  const up = il < ih; // recent low precedes recent high => up-swing
+  const ret = [0.236, 0.382, 0.5, 0.618, 0.786];
+  const ext = [1.382, 1.618, 2.618];
+  const lab = r => `${(r * 100).toFixed(1)}%`;
+  const out = [];
+  if (up) {
+    out.push({ label: "0%", value: H });
+    ret.forEach(r => out.push({ label: lab(r), value: H - span * r }));
+    out.push({ label: "100%", value: L });
+    ext.forEach(r => out.push({ label: lab(r), value: L + span * r }));
+  } else {
+    out.push({ label: "0%", value: L });
+    ret.forEach(r => out.push({ label: lab(r), value: L + span * r }));
+    out.push({ label: "100%", value: H });
+    ext.forEach(r => out.push({ label: lab(r), value: H - span * r }));
+  }
+  out.sort((a, b) => b.value - a.value); // price ladder, high to low
+  return out;
 }
 
 // ---- indicator math ----
@@ -2205,7 +2251,7 @@ function App() {
   }));
   const capmRes = useMemo(() => capmWACC(capm), [capm]);
   const last = data[data.length - 1];
-  const piv = useMemo(() => pivotPoints(last), [last]);
+  const piv = useMemo(() => pivotPoints(priorSessionHLC(data)), [data]);
   const sw = useMemo(() => swingLevels(data), [data]);
   const fibs = useMemo(() => fib(data), [data]);
   const dcf = useMemo(() => runDCF(d), [d]);
