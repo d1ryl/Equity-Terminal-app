@@ -1727,7 +1727,7 @@ function FinalReadCard({
       background: c.panel2,
       borderRadius: 8,
       padding: 16,
-      marginBottom: 16
+      marginBottom: 18
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: {
@@ -1816,8 +1816,8 @@ function FinalReadCard({
   }, "Mechanical multi-factor score (strength ", sig.confidence, "/100) \u2014 a weighting of the signals below, not a probability or price prediction. Technicals gauge timing; DCF gauges long-term value.")), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "grid",
-      gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
-      gap: "4px 22px",
+      gridTemplateColumns: "repeat(auto-fit, minmax(128px, 1fr))",
+      gap: "8px 16px",
       marginTop: 14,
       paddingTop: 12,
       borderTop: "1px solid " + c.line
@@ -1988,10 +1988,11 @@ function DcfInsightCard({
   return /*#__PURE__*/React.createElement("div", {
     style: {
       border: "1px solid " + c.line,
+      borderLeft: "3px solid " + c.gold,
       background: c.panel2,
       borderRadius: 8,
       padding: 16,
-      marginBottom: 16
+      marginBottom: 18
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: {
@@ -2077,10 +2078,11 @@ function AnalystCard({
   return /*#__PURE__*/React.createElement("div", {
     style: {
       border: "1px solid " + c.line,
+      borderLeft: "3px solid " + c.gold,
       background: c.panel2,
       borderRadius: 8,
       padding: 16,
-      marginBottom: 16
+      marginBottom: 18
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: {
@@ -2288,7 +2290,7 @@ function App() {
     setLoading(true);
     setNote("Fetching…");
     try {
-      const r = await fetch(`${backend}/api/candles?code=${encodeURIComponent(code)}&count=120&period=${pd}`);
+      const r = await fetch(`${backend}/api/candles?code=${encodeURIComponent(code)}&count=750&period=${pd}`);
       const j = await r.json();
       if (!j.bars || !j.bars.length) throw new Error(j.detail || "no candles returned");
       setData(j.bars);
@@ -2662,15 +2664,6 @@ function App() {
       ...inputStyle,
       width: 100,
       textTransform: "uppercase"
-    }
-  }), /*#__PURE__*/React.createElement("input", {
-    value: backend,
-    onChange: e => setBackend(e.target.value),
-    placeholder: "https://app.vercel.app",
-    style: {
-      ...inputStyle,
-      width: 185,
-      fontSize: 12
     }
   }), /*#__PURE__*/React.createElement("button", {
     onClick: () => fetchLive(),
