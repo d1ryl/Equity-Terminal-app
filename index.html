@@ -1440,6 +1440,35 @@ function DcfInsightCard({ dcf, c, pct, d }) {
       "⚠ Shares count ("+d.shares.toLocaleString()+"M) looks high — SEC EDGAR sometimes returns fully-diluted shares including all options and warrants. TSLA basic shares are ~3,200M. Check the Shares input below and correct if needed."),
     d && d.wacc > 0.12 && React.createElement("div", { style: { marginTop:8, padding:"8px 12px", background:c.red+"18", border:"1px solid "+c.red+"66", borderRadius:6, fontSize:11, color:c.red, lineHeight:1.5 } },
       "⚠ WACC of "+(d.wacc*100).toFixed(1)+"% is high — at this rate, most DCFs compress to near zero. For reference: S&P 500 long-run equity return ~9-10%, TSLA CAPM WACC is typically 8-11%. Check your CAPM inputs, especially beta."),
+    d && d.price && dcf.wtdPerShare && React.createElement("div", { style: { marginTop:12, padding:"10px 14px", background:c.panel, border:"1px solid "+c.line+"88", borderRadius:6 } },
+      React.createElement("div", { style: { fontSize:10, letterSpacing:".08em", textTransform:"uppercase", color:c.gold, marginBottom:6 } }, "Why market price may differ from DCF"),
+      React.createElement("div", { style: { fontSize:11, color:c.mut, lineHeight:1.65 } },
+        "DCF values only ", React.createElement("b", { style:{color:c.ink} }, "known cash flows"), " from existing businesses. The market also prices in ",
+        React.createElement("b", { style:{color:c.ink} }, "optionality"), " — new markets, unproven products, and platform effects that don't yet appear in FCF. ",
+        "For growth stocks (TSLA, NVDA, etc.) the gap between DCF and market price often represents the market's bet on the bull scenario. ",
+        "To justify the current price of $", d.price.toFixed(2), ", implied FCF growth would need to be ~",
+        (function() {
+          // Back-solve: what growth rate makes perShare = price?
+          const target = d.price * d.shares - d.netDebt;  // implied equity value in millions -- wait target EV
+          // binary search growth rate
+          let lo = 0, hi = 1, mid, result = null;
+          for (let i = 0; i < 40; i++) {
+            mid = (lo + hi) / 2;
+            let f = d.fcf0, pv = 0;
+            for (let t = 1; t <= 10; t++) {
+              const g = t <= 5 ? mid : mid + (d.gt - mid) * ((t-5)/5);
+              f = f * (1+g);
+              pv += f / Math.pow(1+d.wacc, t);
+            }
+            const tv = f * (1+d.gt) / (d.wacc - d.gt);
+            const pvTV = tv / Math.pow(1+d.wacc, 10);
+            const ps = (pv + pvTV - d.netDebt) / d.shares;
+            if (ps < d.price) lo = mid; else hi = mid;
+            result = mid;
+          }
+          return result != null ? (result*100).toFixed(0)+"%" : "N/A";
+        })(),
+        "/yr — that's your break-even growth assumption.")),
     React.createElement("div", { style: { fontSize:10, color:c.mut, marginTop:10, lineHeight:1.45 } },
       "Exit-multiple method values the final-year FCF at your exit multiple instead of a perpetuity; the blend averages the two. Not financial advice — outputs are only as good as your assumptions below."));
 }
@@ -1461,7 +1490,12 @@ function AnalystCard({ analyst, dcf, c, pct, price }) {
   const dcfVsMean = mean && dcf.valid ? dcf.perShare / mean - 1 : null;
   const priceVsMean = mean && price ? mean / price - 1 : null;
   return React.createElement("div", { style: { border:"1px solid "+c.line, borderLeft:"3px solid "+c.gold, background:c.panel2, borderRadius:8, padding:16, marginBottom:18 } },
-    React.createElement("div", { style: { fontSize:10, letterSpacing:".12em", textTransform:"uppercase", color:c.gold, marginBottom:12 } }, "Market · analyst views"),
+    React.createElement("div", { style: { display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12 } },
+      React.createElement("div", { style: { fontSize:10, letterSpacing:".12em", textTransform:"uppercase", color:c.gold } }, "Market · analyst views"),
+      pt && React.createElement("span", { style: { fontSize:9, color:c.mut, background:c.panel, border:"1px solid "+c.line, borderRadius:999, padding:"2px 8px" } },
+        pt.source === "yahoo" ? "via Yahoo Finance (yfinance)" :
+        pt.source && pt.source.startsWith("fmp") ? "via FMP" :
+        pt.source === "finnhub" ? "via Finnhub" : pt.source || "")),
     React.createElement("div", { style: { display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(110px, 1fr))", gap:"12px 18px" } },
       cell("Rating consensus", rec?rec.consensus:"—", consColor),
       rec && cell("Analysts", String(rec.total), c.ink),
@@ -1472,6 +1506,15 @@ function AnalystCard({ analyst, dcf, c, pct, price }) {
     mean && React.createElement("div", { style: { display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(150px, 1fr))", gap:"10px 18px", marginTop:14, paddingTop:12, borderTop:"1px solid "+c.line } },
       priceVsMean != null && cell("Price vs avg target", pct(priceVsMean), priceVsMean>=0?c.green:c.red),
       dcfVsMean != null && cell("Your DCF vs avg target", pct(dcfVsMean), dcfVsMean>=0?c.green:c.red)),
+    !mean && React.createElement("div", { style: { padding:"10px 12px", background:c.panel, border:"1px solid "+c.line, borderRadius:6, marginTop:12, fontSize:12, color:c.mut, lineHeight:1.6 } },
+      "Price targets not available for this ticker from Yahoo Finance or FMP. This can happen for smaller stocks with limited analyst coverage. Try refreshing or check that the ticker is correct."),
+    analyst.analystEstimates && React.createElement("div", { style: { marginTop:12, paddingTop:12, borderTop:"1px solid "+c.line } },
+      React.createElement("div", { style: { fontSize:10, letterSpacing:".08em", textTransform:"uppercase", color:c.gold, marginBottom:8 } }, "Analyst consensus estimates (next FY)"),
+      React.createElement("div", { style: { display:"flex", flexWrap:"wrap", gap:"10px 20px" } },
+        analyst.analystEstimates.revenueAvg && cell("Revenue est (avg)", "$"+(analyst.analystEstimates.revenueAvg/1e9).toFixed(1)+"B", c.ink),
+        analyst.analystEstimates.revenueHigh && cell("Revenue est (high)", "$"+(analyst.analystEstimates.revenueHigh/1e9).toFixed(1)+"B", c.green),
+        analyst.analystEstimates.revenueLow && cell("Revenue est (low)", "$"+(analyst.analystEstimates.revenueLow/1e9).toFixed(1)+"B", c.red),
+        analyst.analystEstimates.epsAvg && cell("EPS est (avg)", "$"+Number(analyst.analystEstimates.epsAvg).toFixed(2), c.ink))),
     analyst.notes && analyst.notes.length > 0 && React.createElement("div", { style: { marginTop:12, padding:"8px 12px", background:c.panel, border:"1px solid "+c.line, borderRadius:6 } },
       React.createElement("div", { style: { fontSize:10, letterSpacing:".06em", textTransform:"uppercase", color:c.mut, marginBottom:6 } }, "Setup notes"),
       analyst.notes.map((n,i) => React.createElement("div", { key:i, style: { fontSize:11, color:c.mut, lineHeight:1.6 } },
@@ -3114,7 +3157,7 @@ function App() {
       setAnalyst(null);
       try {
         const a = await (await fetch(`${backend}/api/analyst?code=${encodeURIComponent(code)}`)).json();
-        if (a && (a.recommendation || a.priceTarget || a.notes)) setAnalyst(a);
+        if (a && (a.recommendation || a.priceTarget || a.analystEstimates || a.notes)) setAnalyst(a);
       } catch (_) {}
       setNote(`Live · ${j.count} ${pd} bars for ${code}.${extra}`);
     } catch (e) {
