@@ -1337,9 +1337,14 @@ function BacktestCard({ bt, c, pct }) {
       " Win rate alone is misleading; weigh it against profit factor and expectancy."));
 }
 
-function DcfInsightCard({ dcf, c, pct }) {
+function DcfInsightCard({ dcf, c, pct, d }) {
   const money = x => x == null ? "—" : "$" + x.toFixed(2);
   const tvHot = dcf.tvWeight != null && dcf.tvWeight > 0.8;
+  // Shares sanity: EDGAR sometimes returns fully-diluted count (incl. all options/warrants)
+  // which inflates share count and suppresses per-share value. Flag if suspicious.
+  const sharesHigh = d && d.shares && d.price && d.shares > 0
+    ? (d.shares * d.price) > (dcf.equity * 1.5) && dcf.equity > 0
+    : false;
   const cell = (label, value, color) => React.createElement("div", { style: { display:"flex", flexDirection:"column", gap:2 } },
     React.createElement("span", { style: { fontSize:9, letterSpacing:".05em", textTransform:"uppercase", color:c.mut } }, label),
     React.createElement("span", { style: { fontSize:14, fontWeight:600, color:color||c.ink, fontVariantNumeric:"tabular-nums" } }, value));
@@ -1355,6 +1360,24 @@ function DcfInsightCard({ dcf, c, pct }) {
     dcf.warns && dcf.warns.length > 0 && React.createElement("ul", { style: { margin:"12px 0 0", padding:0, listStyle:"none", display:"flex", flexDirection:"column", gap:5 } },
       dcf.warns.map((w,i) => React.createElement("li", { key:i, style: { fontSize:11.5, color:c.ink, lineHeight:1.4 } },
         React.createElement("span", { style: { color:c.gold, marginRight:6 } }, "⚠"), w))),
+    d && React.createElement("div", { style: { marginTop:12, padding:"10px 12px", background:c.panel, border:"1px solid "+c.line, borderRadius:6 } },
+      React.createElement("div", { style: { display:"flex", gap:18, flexWrap:"wrap", alignItems:"center" } },
+        React.createElement("div", null,
+          React.createElement("div", { style: { fontSize:9, letterSpacing:".05em", textTransform:"uppercase", color:c.mut, marginBottom:2 } }, "Shares used (M)"),
+          React.createElement("div", { style: { fontSize:13, fontWeight:600, color:c.ink, fontVariantNumeric:"tabular-nums" } }, d.shares ? d.shares.toLocaleString() : "—")),
+        React.createElement("div", null,
+          React.createElement("div", { style: { fontSize:9, letterSpacing:".05em", textTransform:"uppercase", color:c.mut, marginBottom:2 } }, "Base FCF (M)"),
+          React.createElement("div", { style: { fontSize:13, fontWeight:600, color:c.ink } }, d.fcf0 ? "$"+d.fcf0.toLocaleString() : "—")),
+        React.createElement("div", null,
+          React.createElement("div", { style: { fontSize:9, letterSpacing:".05em", textTransform:"uppercase", color:c.mut, marginBottom:2 } }, "WACC"),
+          React.createElement("div", { style: { fontSize:13, fontWeight:600, color:d.wacc>0.12?c.red:c.ink } }, (d.wacc*100).toFixed(2)+"%")),
+        React.createElement("div", null,
+          React.createElement("div", { style: { fontSize:9, letterSpacing:".05em", textTransform:"uppercase", color:c.mut, marginBottom:2 } }, "Net debt / (cash) (M)"),
+          React.createElement("div", { style: { fontSize:13, fontWeight:600, color:d.netDebt<0?c.green:c.red } }, (d.netDebt<0?"Net cash $":"Net debt $")+Math.abs(d.netDebt).toLocaleString())))),
+    d && d.shares > 4000 && React.createElement("div", { style: { marginTop:8, padding:"8px 12px", background:c.red+"18", border:"1px solid "+c.red+"66", borderRadius:6, fontSize:11, color:c.red, lineHeight:1.5 } },
+      "⚠ Shares count ("+d.shares.toLocaleString()+"M) looks high — SEC EDGAR sometimes returns fully-diluted shares including all options and warrants. TSLA basic shares are ~3,200M. Check the Shares input below and correct if needed."),
+    d && d.wacc > 0.12 && React.createElement("div", { style: { marginTop:8, padding:"8px 12px", background:c.red+"18", border:"1px solid "+c.red+"66", borderRadius:6, fontSize:11, color:c.red, lineHeight:1.5 } },
+      "⚠ WACC of "+(d.wacc*100).toFixed(1)+"% is high — at this rate, most DCFs compress to near zero. For reference: S&P 500 long-run equity return ~9-10%, TSLA CAPM WACC is typically 8-11%. Check your CAPM inputs, especially beta."),
     React.createElement("div", { style: { fontSize:10, color:c.mut, marginTop:10, lineHeight:1.45 } },
       "Exit-multiple method values the final-year FCF at your exit multiple instead of a perpetuity; the blend averages the two. Not financial advice — outputs are only as good as your assumptions below."));
 }
@@ -1387,8 +1410,17 @@ function AnalystCard({ analyst, dcf, c, pct, price }) {
     mean && React.createElement("div", { style: { display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(150px, 1fr))", gap:"10px 18px", marginTop:14, paddingTop:12, borderTop:"1px solid "+c.line } },
       priceVsMean != null && cell("Price vs avg target", pct(priceVsMean), priceVsMean>=0?c.green:c.red),
       dcfVsMean != null && cell("Your DCF vs avg target", pct(dcfVsMean), dcfVsMean>=0?c.green:c.red)),
-    analyst.notes && analyst.notes.length > 0 && React.createElement("ul", { style: { margin:"12px 0 0", padding:0, listStyle:"none", display:"flex", flexDirection:"column", gap:4 } },
-      analyst.notes.map((n,i) => React.createElement("li", { key:i, style: { fontSize:11, color:c.mut, lineHeight:1.4 } }, "· ", n))),
+    analyst.notes && analyst.notes.length > 0 && React.createElement("div", { style: { marginTop:12, padding:"8px 12px", background:c.panel, border:"1px solid "+c.line, borderRadius:6 } },
+      React.createElement("div", { style: { fontSize:10, letterSpacing:".06em", textTransform:"uppercase", color:c.mut, marginBottom:6 } }, "Setup notes"),
+      analyst.notes.map((n,i) => React.createElement("div", { key:i, style: { fontSize:11, color:c.mut, lineHeight:1.6 } },
+        !pt && n.toLowerCase().includes("price target") ?
+          React.createElement("span", null,
+            React.createElement("span", { style: { color:c.gold } }, "⚠ "), n,
+            " → ",
+            React.createElement("a", { href:"https://financialmodelingprep.com/developer/docs/", target:"_blank", style: { color:c.blue, textDecoration:"none" } }, "Get FMP key (free tier available)"),
+            " or ",
+            React.createElement("a", { href:"https://finnhub.io/pricing", target:"_blank", style: { color:c.blue, textDecoration:"none" } }, "upgrade Finnhub"))
+          : React.createElement("span", null, "· ", n)))),
     React.createElement("div", { style: { fontSize:10, color:c.mut, marginTop:10, lineHeight:1.45 } },
       "Targets and ratings are third-party analyst opinions, not Equity Terminal's view — shown for comparison only."));
 }
@@ -1786,6 +1818,115 @@ function computeQuantEngine(data, ind, dcf) {
 }
 
 // ================================================================
+// TRADE SETUP GENERATOR
+// Produces concrete entry/stop/target for each active engine signal
+// ================================================================
+function generateTradeSetups(data, ind, quant) {
+  if (!data || !data.length || !quant) return [];
+  const n = data.length - 1;
+  const price = data[n].close;
+  const atr = ind.atr[n] || (price * 0.02);
+  const setups = [];
+
+  // ── FACTOR SETUP ──
+  if (quant.factor.factorScore >= 60) {
+    const entry = price;                          // enter at market on next open
+    const stop  = +(entry - 2 * atr).toFixed(2); // 2× ATR initial stop
+    const t1    = +(entry + 2 * atr).toFixed(2); // 1:1 first target
+    const t2    = +(entry + 4 * atr).toFixed(2); // 1:2 extended target
+    const riskPct = +((entry - stop) / entry * 100).toFixed(2);
+    const rewardPct = +((t2 - entry) / entry * 100).toFixed(2);
+    const rrr = +((t2 - entry) / (entry - stop)).toFixed(2);
+    const active = quant.factor.factorScore >= 75 ? "Strong — enter now" :
+      quant.factor.factorScore >= 60 ? "Moderate — wait for a pullback to EMA50" : null;
+    if (active) setups.push({
+      engine: "Factor Model",
+      signal: quant.factor.factorSignal,
+      active,
+      entry, stop, t1, t2,
+      riskPct, rewardPct, rrr,
+      sizing: +(quant.factor.posSize * 100).toFixed(1),
+      invalidate: "Close below " + stop + " — stop triggered",
+      notes: "Entry based on current close. In real trading, use a limit order at or below EMA50 (" +
+        (ind.ema50[n] ? ind.ema50[n].toFixed(2) : "N/A") + ") for a better fill.",
+      accent: "green"
+    });
+  }
+
+  // ── STAT ARB SETUP ──
+  if (quant.statArb.priceZ !== null && quant.statArb.priceZ <= -1.0) {
+    const bb = ind.bb && ind.bb[n];
+    const mean20 = bb ? (bb.u + bb.l) / 2 : price * 1.02;
+    const entry = price;
+    const stop  = +(price - 1.5 * atr).toFixed(2);   // tighter stop — mean reversion trades are short duration
+    const t1    = +(mean20).toFixed(2);                // target = return to 20-bar mean
+    const t2    = +(bb ? bb.u : price * 1.04).toFixed(2); // extended = upper Bollinger band
+    const riskPct = +((entry - stop) / entry * 100).toFixed(2);
+    const rrr = +((t1 - entry) / Math.max(0.001, entry - stop)).toFixed(2);
+    const urgency = quant.statArb.priceZ <= -2.0
+      ? "Strong — z-score extreme, enter now"
+      : "Moderate — z-score stretched, consider entering";
+    setups.push({
+      engine: "Stat Arb / Mean Reversion",
+      signal: quant.statArb.statArbSignal,
+      active: urgency,
+      entry, stop, t1, t2,
+      riskPct, rewardPct: +((t1 - entry) / entry * 100).toFixed(2), rrr,
+      sizing: +(quant.statArb.posSize * 100).toFixed(1) || 2,
+      invalidate: "Close below " + stop + " OR z-score continues falling past -3.0",
+      notes: "Mean-reversion trades are short-duration (target: 3-10 bars). Exit at T1 if price reaches mean. This is NOT a trend trade — reduce size vs CTA.",
+      accent: "blue"
+    });
+  }
+
+  // ── CTA TREND SETUP ──
+  if (quant.cta.ctaScore >= 60) {
+    const don20Upper = ind.ema50[n]; // fallback
+    const entry = quant.cta.above20Upper
+      ? price                                      // already broken out — enter at market
+      : +(price * 1.005).toFixed(2);              // buy-stop just above current price on breakout
+    const stop  = +(entry - 2 * atr).toFixed(2);
+    const t1    = +(entry + 3 * atr).toFixed(2);  // CTA trades run longer — 1:1.5 min
+    const t2    = +(entry + 6 * atr).toFixed(2);  // trend target: 1:3
+    const riskPct = +((entry - stop) / entry * 100).toFixed(2);
+    const rrr = +((t2 - entry) / Math.max(0.001, entry - stop)).toFixed(2);
+    const active = quant.cta.above55Upper
+      ? "Strong — 55-bar Donchian breakout confirmed, enter at market"
+      : quant.cta.above20Upper
+        ? "Active — 20-bar breakout, enter at market"
+        : "Pending — set a buy-stop at " + entry + " (just above 20-bar high)";
+    setups.push({
+      engine: "CTA Trend Following",
+      signal: quant.cta.ctaSignal,
+      active,
+      entry, stop, t1, t2,
+      riskPct, rewardPct: +((t2 - entry) / entry * 100).toFixed(2), rrr,
+      sizing: +(quant.cta.posSize * 100).toFixed(1),
+      invalidate: "Close below " + stop + " OR ADX drops below 20 (trend fading)",
+      notes: "CTA trades are momentum — let winners run. Trail stop up by 1 ATR for every 2 ATR of profit. ADX: " +
+        (quant.cta.adxVal || "N/A"),
+      accent: "violet"
+    });
+  }
+
+  // If no engine is active
+  if (!setups.length) {
+    setups.push({
+      engine: "No Active Setup",
+      signal: "Wait",
+      active: "No engine currently meets entry criteria. Check back after next candle close.",
+      entry: null, stop: null, t1: null, t2: null,
+      riskPct: 0, rewardPct: 0, rrr: 0, sizing: 0,
+      invalidate: "—",
+      notes: "Combined score: " + quant.combined + "/100. Engines need score ≥60 to generate a setup.",
+      accent: "gold"
+    });
+  }
+
+  return setups;
+}
+
+// ================================================================
 // REACT COMPONENT: QuantTab
 // ================================================================
 function QuantTab({ data, ind, dcf, c, pct, fmt }) {
@@ -1869,6 +2010,47 @@ function QuantTab({ data, ind, dcf, c, pct, fmt }) {
         cell("Suggested size", suggestedSize > 0 ? suggestedSize+"% of portfolio" : "0% (no signal)", suggestedSize>0?c.green:c.mut)),
       React.createElement("div", { style: { fontSize: 10, color: c.mut, marginTop: 10, lineHeight: 1.5 } },
         "Factor (40%) × CTA (40%) × Mean-Reversion (20%). Position sizing = ATR-normalized risk 1% per trade, capped at 10%. All in-sample on current ticker — not a promise of future returns. Not financial advice.")),
+
+    // ---- TRADE SETUPS ----
+    (function() {
+      const setups = generateTradeSetups(data, ind, quant);
+      const accentMap = { green: c.green, blue: c.blue, violet: c.violet, gold: c.gold, red: c.red };
+      return React.createElement("div", {
+        style: { border:"1px solid "+c.line, borderLeft:"4px solid "+c.green, background:c.panel2, borderRadius:8, padding:16, marginBottom:20 }
+      },
+        React.createElement("div", { style: { fontFamily:"'Fraunces',Georgia,serif", fontSize:15, color:c.gold, marginBottom:4 } }, "Active Trade Setups"),
+        React.createElement("div", { style: { fontSize:11, color:c.mut, marginBottom:14 } }, "Concrete entry, stop, and target levels from engines that currently meet their entry criteria."),
+        setups.map((setup, si) => {
+          const ac = accentMap[setup.accent] || c.gold;
+          const hasSetup = setup.entry !== null;
+          return React.createElement("div", { key:si, style: { border:"1px solid "+c.line, borderLeft:"3px solid "+ac, borderRadius:6, padding:"12px 14px", marginBottom: si < setups.length-1 ? 12 : 0, background:c.panel } },
+            React.createElement("div", { style: { display:"flex", justifyContent:"space-between", alignItems:"baseline", flexWrap:"wrap", gap:8, marginBottom:8 } },
+              React.createElement("div", null,
+                React.createElement("span", { style: { fontSize:10, letterSpacing:".1em", textTransform:"uppercase", color:ac } }, setup.engine),
+                React.createElement("span", { style: { marginLeft:10, fontSize:12, color:c.mut } }, setup.signal)),
+              React.createElement("span", { style: { fontSize:11, fontWeight:600, color:ac } }, setup.active)),
+            hasSetup && React.createElement("div", { style: { display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(100px,1fr))", gap:"8px 14px", marginBottom:10 } },
+              [
+                ["Entry (market)", "$"+setup.entry, c.ink],
+                ["Stop loss", "$"+setup.stop, c.red],
+                ["Target 1 (T1)", "$"+setup.t1, c.green],
+                ["Target 2 (T2)", "$"+setup.t2, c.green],
+                ["Risk %", setup.riskPct+"%", c.red],
+                ["Reward % (T2)", setup.rewardPct+"%", c.green],
+                ["Risk:Reward", "1 : "+setup.rrr, setup.rrr >= 2 ? c.green : setup.rrr >= 1 ? c.gold : c.red],
+                ["Position size", setup.sizing+"%", c.ink],
+              ].map(([lbl,val,col]) =>
+                React.createElement("div", { key:lbl, style: { display:"flex", flexDirection:"column", gap:2 } },
+                  React.createElement("span", { style: { fontSize:9, letterSpacing:".05em", textTransform:"uppercase", color:c.mut } }, lbl),
+                  React.createElement("span", { style: { fontSize:13, fontWeight:600, color:col, fontVariantNumeric:"tabular-nums" } }, val)))),
+            React.createElement("div", { style: { fontSize:11, color:c.mut, marginBottom:4 } },
+              React.createElement("span", { style: { color:c.red, fontWeight:600 } }, "Invalidate: "), setup.invalidate),
+            React.createElement("div", { style: { fontSize:11, color:c.mut, lineHeight:1.5 } },
+              React.createElement("span", { style: { color:c.gold, fontWeight:600 } }, "Note: "), setup.notes));
+        }),
+        React.createElement("div", { style: { fontSize:10, color:c.mut, marginTop:12, lineHeight:1.5 } },
+          "Entry/stop/target are computed from the current bar's ATR and price. Use limit orders for better fills. Always verify against the chart before acting. Not financial advice."));
+    })(),
 
     // ---- FACTOR MODEL ----
     card(React.createElement("div", null,
@@ -2603,6 +2785,54 @@ function ValidatorPanel({ data, ind, c, pct }) {
           : "✓ Strategy performs better in choppy markets (Sharpe "+regime.choppy.sharpe.toFixed(2)+" vs "+regime.trending.sharpe.toFixed(2)+"). The mean-reversion component is doing the heavy lifting."),
       React.createElement("div", { style: { fontSize:10, color:c.mut, marginTop:10, lineHeight:1.5 } },
         "Real quant funds target regime-agnostic returns. If your strategy only works in one regime, position-size down when the other regime is active.")),
+    c.gold),
+
+    // ── NEXT ENTRY TRIGGERS ──
+    cardWrap(React.createElement("div", null,
+      sectionHead("When To Enter — Next Trigger Checklist", "Watch these conditions on the next bar close"),
+      React.createElement("div", { style: { display:"flex", flexDirection:"column", gap:10 } },
+        [
+          {
+            label: "Factor Model entry",
+            condition: "SMA20 crosses above EMA50",
+            secondary: "AND RSI > 50 AND OBV trending up",
+            action: "Enter at market on next candle open. Stop: 2× ATR below entry.",
+            active: result.baseline && result.baseline.byStype.factor > 0
+          },
+          {
+            label: "Stat Arb entry",
+            condition: "Price z-score (20-bar) drops below −1.5",
+            secondary: "AND Bollinger %B < 20% (near lower band)",
+            action: "Enter at market. Target: return to 20-bar mean. Exit after 10 bars max.",
+            active: result.baseline && result.baseline.byStype.statarb > 0
+          },
+          {
+            label: "CTA Trend entry",
+            condition: "Price closes above 20-bar Donchian upper band",
+            secondary: "AND ADX > 20 (confirmed trend, not false breakout)",
+            action: "Enter at market or set buy-stop just above the 20-bar high. Stop: 2× ATR. Trail: 1 ATR per 2 ATR profit.",
+            active: result.baseline && result.baseline.byStype.cta > 0
+          },
+          {
+            label: "All-engine confluence (highest conviction)",
+            condition: "Factor score ≥ 75 AND CTA breakout active AND z-score < −0.5",
+            secondary: "All three engines agree = rare but highest-quality signal",
+            action: "Enter full position. This is the setup professional quant funds wait for.",
+            active: false
+          }
+        ].map((item, i) =>
+          React.createElement("div", { key:i, style: { padding:"10px 12px", border:"1px solid "+c.line, borderRadius:6, background:c.panel } },
+            React.createElement("div", { style: { display:"flex", justifyContent:"space-between", alignItems:"center", flexWrap:"wrap", gap:6, marginBottom:6 } },
+              React.createElement("span", { style: { fontSize:11, fontWeight:700, color:c.gold, letterSpacing:".06em", textTransform:"uppercase" } }, item.label),
+              React.createElement("span", { style: { fontSize:10, color: item.active ? c.green : c.mut, border:"1px solid "+(item.active?c.green:c.line), borderRadius:999, padding:"2px 8px" } },
+                item.active ? "✓ Fired in backtest" : "Not triggered recently")),
+            React.createElement("div", { style: { fontSize:12, color:c.ink, marginBottom:3 } },
+              React.createElement("span", { style: { color:c.green, marginRight:6 } }, "Condition:"), item.condition),
+            React.createElement("div", { style: { fontSize:11, color:c.mut, marginBottom:6 } }, item.secondary),
+            React.createElement("div", { style: { fontSize:11, color:c.blue } },
+              React.createElement("span", { style: { fontWeight:700 } }, "Action: "), item.action)))),
+      React.createElement("div", { style: { fontSize:10, color:c.mut, marginTop:12, lineHeight:1.5 } },
+        "These are mechanical rules — not predictions. A condition being met is a trigger to look closer at the chart and size in, not a guarantee of profit. Always check the Regime Analysis above: if ADX < 20 and the market is choppy, CTA triggers have lower reliability.")),
     c.gold),
 
     // ── RE-RUN BUTTON ──
@@ -3611,7 +3841,7 @@ function App() {
       borderRadius: "0 10px 10px 10px",
       padding: 18
     }
-  }, /*#__PURE__*/React.createElement(DcfInsightCard, { dcf: dcf, c: c, pct: pct }),
+  }, /*#__PURE__*/React.createElement(DcfInsightCard, { dcf: dcf, c: c, pct: pct, d: d }),
   /*#__PURE__*/React.createElement(AnalystCard, { analyst: analyst, dcf: dcf, c: c, pct: pct, price: d.price }),
   /*#__PURE__*/React.createElement("div", {
     style: {
