@@ -3157,12 +3157,18 @@ function App() {
         const bk = await (await fetch(`${backend}/api/benchmark?count=120&period=${pd}`)).json();
         if (bk.bars && bk.bars.length) setBenchData(bk.bars.map(b => b.close));
       } catch (_) {}
-      // Fetch analyst views (best-effort)
+      // Fetch analyst views (best-effort, 12s timeout)
       setAnalyst(null);
       try {
-        const a = await (await fetch(`${backend}/api/analyst?code=${encodeURIComponent(code)}`)).json();
+        const _ctrl = new AbortController();
+        const _timer = setTimeout(() => _ctrl.abort(), 12000);
+        const a = await (await fetch(`${backend}/api/analyst?code=${encodeURIComponent(code)}`, { signal: _ctrl.signal })).json();
+        clearTimeout(_timer);
         if (a && a.ticker) setAnalyst(a);
-      } catch (_) {}
+        else setAnalyst({ ticker: code, recommendation: null, priceTarget: null, analystEstimates: null, notes: ["Analyst endpoint returned no data — check backend logs."] });
+      } catch (err) {
+        setAnalyst({ ticker: code, recommendation: null, priceTarget: null, analystEstimates: null, notes: [err.name === "AbortError" ? "Analyst fetch timed out (>12s) — yfinance may be slow on this server." : "Analyst fetch failed: " + err.message] });
+      }
       setNote(`Live · ${j.count} ${pd} bars for ${code}.${extra}`);
     } catch (e) {
       setStatus("error");
