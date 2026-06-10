@@ -515,30 +515,6 @@ function pivotPoints(b) {
     S3: L - 2 * (H - P)
   };
 }
-
-// classic pivots need the PRIOR session's range, not one intraday bar.
-// intraday -> aggregate the prior calendar day; daily -> the prior bar.
-function priorSessionHLC(data) {
-  if (!data || data.length < 2)
-    return data && data.length ? data[data.length - 1] : { high: 0, low: 0, close: 0 };
-  const dayOf = v => String(v == null ? "" : v).slice(0, 10);
-  const lastDay = dayOf(data[data.length - 1].date);
-  let priorDay = null;
-  for (let i = data.length - 1; i >= 0; i--) {
-    const dd = dayOf(data[i].date);
-    if (dd !== lastDay) { priorDay = dd; break; }
-  }
-  if (priorDay == null) {
-    const b = data[data.length - 2];
-    return { high: b.high, low: b.low, close: b.close };
-  }
-  const grp = data.filter(b => dayOf(b.date) === priorDay);
-  return {
-    high: Math.max(...grp.map(b => b.high)),
-    low: Math.min(...grp.map(b => b.low)),
-    close: grp[grp.length - 1].close
-  };
-}
 function swingLevels(data, k = 4) {
   const cur = data[data.length - 1].close;
   const pts = [];
@@ -570,35 +546,13 @@ function swingLevels(data, k = 4) {
   };
 }
 function fib(data) {
-  const n = data.length;
-  if (!n) return [];
-  // auto-anchor to the most recent swing (recent window), not the all-time range
-  const W = Math.max(30, Math.min(n, Math.round(n * 0.2)));
-  const win = data.slice(n - W);
-  let H = -Infinity, L = Infinity, ih = 0, il = 0;
-  win.forEach((b, i) => {
-    if (b.high > H) { H = b.high; ih = i; }
-    if (b.low < L) { L = b.low; il = i; }
-  });
-  const span = (H - L) || 1;
-  const up = il < ih; // recent low precedes recent high => up-swing
-  const ret = [0.236, 0.382, 0.5, 0.618, 0.786];
-  const ext = [1.382, 1.618, 2.618];
-  const lab = r => `${(r * 100).toFixed(1)}%`;
-  const out = [];
-  if (up) {
-    out.push({ label: "0%", value: H });
-    ret.forEach(r => out.push({ label: lab(r), value: H - span * r }));
-    out.push({ label: "100%", value: L });
-    ext.forEach(r => out.push({ label: lab(r), value: L + span * r }));
-  } else {
-    out.push({ label: "0%", value: L });
-    ret.forEach(r => out.push({ label: lab(r), value: L + span * r }));
-    out.push({ label: "100%", value: H });
-    ext.forEach(r => out.push({ label: lab(r), value: H - span * r }));
-  }
-  out.sort((a, b) => b.value - a.value); // price ladder, high to low
-  return out;
+  const hi = Math.max(...data.map(b => b.high)),
+    lo = Math.min(...data.map(b => b.low));
+  const span = hi - lo;
+  return [0.236, 0.382, 0.5, 0.618, 0.786].map(r => ({
+    label: `${(r * 100).toFixed(1)}%`,
+    value: hi - span * r
+  }));
 }
 
 // ---- indicator math ----
@@ -806,141 +760,8 @@ function backtest(data, sig) {
   };
 }
 
-// ---- backtest the FINAL multi-factor engine (long-only, in-sample, ATR stops, fees) ----
-// NOTE: in-sample, close-to-close fills, no lookahead on S/R (passed null per bar).
-function backtestEngine(data, ind, opts) {
-  const o = opts || {};
-  const feePerSide = o.feePerSide != null ? o.feePerSide : 0.001; // 0.1% each side => 0.2% round trip
-  const atrStopMult = o.atrStopMult != null ? o.atrStopMult : 2;
-  const atrTrailMult = o.atrTrailMult != null ? o.atrTrailMult : 2.5;
-  const n = data.length;
-  const out = {
-    stratRet: 0, bh: 0, trades: 0, winRate: 0,
-    avgWin: 0, avgLoss: 0, profitFactor: null, expectancy: 0,
-    maxDD: 0, timeInMarket: 0, sharpe: null, feesIncluded: true, valid: false
-  };
-  if (n < 30) return out;
-
-  const cl = data.map(b => b.close);
-  const e200 = ema(cl, 200);
-  const e50 = ind.ema50;
-
-  // precompute per-bar rolling helpers
-  const vols = data.map(b => b.volume || 0);
-  const rollMean = (arr, i, w) => {
-    const s = arr.slice(Math.max(0, i - w + 1), i + 1);
-    return s.length ? s.reduce((a, b) => a + b, 0) / s.length : null;
-  };
-
-  const scoreAt = (i) => {
-    if (i < 1) return null;
-    const price = cl[i];
-    const atrAbs = ind.atr[i];
-    return getFinalBuySellSignal({
-      price,
-      ema50: e50[i],
-      ema200: e200[i],
-      rsi: ind.rsi[i],
-      macd: ind.macd.line[i],
-      macdSignal: ind.macd.signal[i],
-      macdHist: ind.macd.hist[i],
-      prevMacd: ind.macd.line[i - 1],
-      prevMacdSignal: ind.macd.signal[i - 1],
-      prevMacdHist: ind.macd.hist[i - 1],
-      k: ind.stoch.k[i],
-      d: ind.stoch.d[i],
-      j: ind.stoch.j[i],
-      prevK: ind.stoch.k[i - 1],
-      prevD: ind.stoch.d[i - 1],
-      prevJ: ind.stoch.j[i - 1],
-      volume: vols[i],
-      avgVolume20: rollMean(vols, i, 20),
-      obv: ind.obv[i],
-      obvMA20: rollMean(ind.obv, i, 20),
-      support: null,
-      resistance: null,
-      relativeStrength: undefined,
-      relativeStrengthMA50: undefined,
-      atrPct: atrAbs != null && price ? atrAbs / price * 100 : null,
-      dcfUpsidePct: undefined // technicals-only timing for the backtest
-    });
-  };
-
-  let pos = false, entry = 0, entryATR = 0, peak = 0, barsIn = 0;
-  let eq = 1;
-  const rets = []; // per-trade net returns
-  const equityCurve = [1];
-
-  const closeTrade = (exitPx) => {
-    const gross = exitPx / entry;
-    const net = gross * (1 - feePerSide) * (1 - feePerSide); // entry+exit cost
-    eq *= net;
-    rets.push(net - 1);
-    equityCurve.push(eq);
-    pos = false;
-  };
-
-  for (let i = 1; i < n; i++) {
-    const sig = scoreAt(i);
-    if (!sig) continue;
-    const price = cl[i];
-    const atrAbs = ind.atr[i] || 0;
-
-    if (!pos) {
-      const longOk = sig.technicalScore >= 40 && (e200[i] == null || price > e200[i]);
-      if (longOk) {
-        pos = true; entry = price; entryATR = atrAbs; peak = price; barsIn = 1;
-      }
-    } else {
-      barsIn++;
-      if (price > peak) peak = price;
-      const trailStop = peak - atrTrailMult * atrAbs;
-      const hardStop = entry - atrStopMult * entryATR;
-      const stopHit = price <= trailStop || price <= hardStop;
-      const weakExit = sig.technicalScore < 0 || (e50[i] != null && price < e50[i]) ||
-        sig.technicalSignal === "Exit / Sell" || sig.technicalSignal === "Strong Sell / Avoid" ||
-        sig.technicalSignal === "Trim / Take Profit";
-      if (stopHit || weakExit) closeTrade(price);
-    }
-  }
-  if (pos) closeTrade(cl[n - 1]);
-
-  const wins = rets.filter(r => r > 0);
-  const losses = rets.filter(r => r <= 0);
-  const sum = a => a.reduce((x, y) => x + y, 0);
-  const grossWin = sum(wins);
-  const grossLoss = Math.abs(sum(losses));
-
-  // max drawdown on equity curve
-  let pk = equityCurve[0], maxDD = 0;
-  for (const v of equityCurve) { if (v > pk) pk = v; const dd = v / pk - 1; if (dd < maxDD) maxDD = dd; }
-
-  // per-trade Sharpe (not annualized)
-  let sharpe = null;
-  if (rets.length > 1) {
-    const m = sum(rets) / rets.length;
-    const variance = sum(rets.map(r => (r - m) * (r - m))) / (rets.length - 1);
-    const sd = Math.sqrt(variance);
-    sharpe = sd > 0 ? m / sd : null;
-  }
-
-  out.stratRet = eq - 1;
-  out.bh = cl[n - 1] / cl[0] - 1;
-  out.trades = rets.length;
-  out.winRate = rets.length ? wins.length / rets.length : 0;
-  out.avgWin = wins.length ? grossWin / wins.length : 0;
-  out.avgLoss = losses.length ? sum(losses) / losses.length : 0;
-  out.profitFactor = grossLoss > 0 ? grossWin / grossLoss : (grossWin > 0 ? Infinity : null);
-  out.expectancy = rets.length ? sum(rets) / rets.length : 0;
-  out.maxDD = maxDD;
-  out.timeInMarket = n > 1 ? barsIn / (n - 1) : 0;
-  out.sharpe = sharpe;
-  out.valid = true;
-  return out;
-}
-
 // ---- plain-English synthesis of trend / momentum / valuation ----
-function computeRead(data, ind, dcf) {
+function computeRead(data, ind, dcf, benchData) {
   const n = data.length - 1,
     price = data[n].close;
   const sma = ind.sma20[n],
@@ -966,6 +787,26 @@ function computeRead(data, ind, dcf) {
     tone: up > 0.15 ? "pos" : up < -0.15 ? "neg" : "neu",
     text: dcf.valid ? `Your DCF puts intrinsic value near ${dcf.perShare.toFixed(2)} vs price ${price.toFixed(2)} — ${(up * 100).toFixed(0)}% ${up >= 0 ? "upside" : "downside"} on your assumptions.` : "Set valid DCF assumptions (WACC must exceed terminal growth) for a valuation read."
   });
+  // Relative Strength vs SPY benchmark
+  const rsWindow = 20;
+  if (benchData && benchData.length >= rsWindow && data.length >= rsWindow) {
+    const stockRet = data[n].close / data[n - rsWindow + 1].close - 1;
+    const benchLen = benchData.length;
+    const spyRet = benchData[benchLen - 1] / benchData[benchLen - rsWindow] - 1;
+    const rsRatio = stockRet - spyRet;   // outperformance vs SPY
+    lines.push({
+      label: "Rel. Strength",
+      tone: rsRatio > 0.02 ? "pos" : rsRatio < -0.02 ? "neg" : "neu",
+      text: `Over the last ${rsWindow} bars, this stock ${rsRatio >= 0 ? "outperformed" : "underperformed"} SPY by ${(Math.abs(rsRatio)*100).toFixed(1)}pp (stock ${(stockRet*100).toFixed(1)}% vs SPY ${(spyRet*100).toFixed(1)}%). ${rsRatio > 0.05 ? "Strong outperformance — institutional accumulation likely." : rsRatio < -0.05 ? "Notable underperformance — risk-off or sector rotation." : "Roughly in line with the market."}`
+    });
+  } else {
+    lines.push({
+      label: "Rel. Strength",
+      tone: "neu",
+      text: "Relative strength vs SPY will appear after first fetch (requires benchmark data)."
+    });
+  }
+
   const tones = lines.map(l => l.tone);
   const pos = tones.filter(t => t === "pos").length,
     neg = tones.filter(t => t === "neg").length;
@@ -1000,9 +841,7 @@ function runDCF({
   wacc,
   netDebt,
   shares,
-  price,
-  mos = 0.2,
-  exitMult
+  price
 }) {
   const proj = [];
   let pvSum = 0;
@@ -1030,21 +869,6 @@ function runDCF({
   const ev = pvSum + pvTV,
     equity = ev - netDebt,
     perShare = equity / shares;
-  const tvWeight = valid && ev ? pvTV / ev : null;
-  const buyBelow = perShare * (1 - (mos || 0));
-  let perShareExit = null, perShareBlended = null;
-  if (valid && exitMult && f) {
-    const tvExit = f * exitMult;
-    const pvTVExit = tvExit / Math.pow(1 + wacc, N);
-    const evExit = pvSum + pvTVExit;
-    perShareExit = (evExit - netDebt) / shares;
-    perShareBlended = (perShare + perShareExit) / 2;
-  }
-  const warns = [];
-  if (valid && wacc - gt < 0.03) warns.push("WACC is within 3 points of terminal growth \u2014 fair value is hypersensitive here.");
-  if (tvWeight != null && tvWeight > 0.8) warns.push("Terminal value is " + (tvWeight * 100).toFixed(0) + "% of enterprise value \u2014 small WACC/g changes move it a lot.");
-  if (fcf0 <= 0) warns.push("Base FCF is zero or negative \u2014 DCF output is unreliable.");
-  if (!valid) warns.push("WACC must exceed terminal growth for a finite valuation.");
   return {
     proj,
     pvSum,
@@ -1054,11 +878,6 @@ function runDCF({
     equity,
     perShare,
     upside: perShare / price - 1,
-    tvWeight,
-    buyBelow,
-    perShareExit,
-    perShareBlended,
-    warns,
     valid,
     N
   };
@@ -1081,502 +900,6 @@ function capmWACC({
     we,
     wd,
     wacc: we * ke + wd * kd * (1 - tax)
-  };
-}
-
-// ===============================
-// EQUITY TERMINAL FINAL SIGNAL ENGINE
-// Technicals = timing
-// DCF = long-term valuation
-// Final Read = combined decision
-// ===============================
-
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
-}
-
-function isValidNumber(value) {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
-function normalizePct(value) {
-  // Accepts either 25 for 25%, or 0.25 for 25%
-  if (!isValidNumber(value)) return null;
-  return Math.abs(value) <= 2 ? value * 100 : value;
-}
-
-function getFinalBuySellSignal({
-  // Price / trend
-  price,
-  ema50,
-  ema200,
-
-  // Momentum
-  rsi,
-  macd,
-  macdSignal,
-  macdHist,
-  prevMacd,
-  prevMacdSignal,
-  prevMacdHist,
-
-  // KDJ
-  k,
-  d,
-  j,
-  prevK,
-  prevD,
-  prevJ,
-
-  // Volume / accumulation
-  volume,
-  avgVolume20,
-  obv,
-  obvMA20,
-
-  // Support / resistance
-  support,
-  resistance,
-
-  // Relative strength
-  // Example: stock / SPY or stock / QQQ ratio
-  relativeStrength,
-  relativeStrengthMA50,
-
-  // Risk
-  atrPct,
-
-  // DCF
-  // Use +25 for +25% upside, or 0.25 for +25% upside
-  dcfUpsidePct
-}) {
-  const reasons = [];
-  const warnings = [];
-
-  let trendScore = 0;              // Max +/-30
-  let momentumScore = 0;           // Max +/-20
-  let accumulationScore = 0;       // Max +/-20
-  let kdjScore = 0;                // Max +/-15
-  let relativeStrengthScore = 0;   // Max +/-15
-  let riskPenalty = 0;             // Max -20
-
-  const dcfUpside = normalizePct(dcfUpsidePct);
-
-  const macdBullCross =
-    isValidNumber(prevMacd) &&
-    isValidNumber(prevMacdSignal) &&
-    prevMacd <= prevMacdSignal &&
-    macd > macdSignal;
-
-  const macdBearCross =
-    isValidNumber(prevMacd) &&
-    isValidNumber(prevMacdSignal) &&
-    prevMacd >= prevMacdSignal &&
-    macd < macdSignal;
-
-  const kdjBullCross =
-    isValidNumber(prevK) &&
-    isValidNumber(prevD) &&
-    prevK <= prevD &&
-    k > d;
-
-  const kdjBearCross =
-    isValidNumber(prevK) &&
-    isValidNumber(prevD) &&
-    prevK >= prevD &&
-    k < d;
-
-  const macdHistRising =
-    isValidNumber(prevMacdHist) &&
-    macdHist > prevMacdHist;
-
-  const jRising =
-    isValidNumber(prevJ) &&
-    j > prevJ;
-
-  const volumeSpike =
-    isValidNumber(volume) &&
-    isValidNumber(avgVolume20) &&
-    volume > avgVolume20 * 1.5;
-
-  const obvBullish =
-    isValidNumber(obv) &&
-    isValidNumber(obvMA20) &&
-    obv > obvMA20;
-
-  const obvBearish =
-    isValidNumber(obv) &&
-    isValidNumber(obvMA20) &&
-    obv < obvMA20;
-
-  const priceNearSupport =
-    isValidNumber(support) &&
-    Math.abs(price - support) / price < 0.04;
-
-  const priceNearResistance =
-    isValidNumber(resistance) &&
-    Math.abs(price - resistance) / price < 0.04;
-
-  const breakoutAboveResistance =
-    isValidNumber(resistance) &&
-    price > resistance;
-
-  const breakdownBelowSupport =
-    isValidNumber(support) &&
-    price < support;
-
-  // ===============================
-  // 1. TREND SCORE: 30%
-  // ===============================
-
-  if (price > ema50) {
-    trendScore += 10;
-    reasons.push("Price is above EMA50.");
-  } else {
-    trendScore -= 10;
-    warnings.push("Price is below EMA50.");
-  }
-
-  if (ema50 > ema200) {
-    trendScore += 12;
-    reasons.push("EMA50 is above EMA200, showing a positive trend.");
-  } else {
-    trendScore -= 12;
-    warnings.push("EMA50 is below EMA200, showing a weak trend.");
-  }
-
-  if (price > ema200) {
-    trendScore += 8;
-    reasons.push("Price is above EMA200.");
-  } else {
-    trendScore -= 8;
-    warnings.push("Price is below EMA200.");
-  }
-
-  trendScore = clamp(trendScore, -30, 30);
-
-  // ===============================
-  // 2. MOMENTUM SCORE: 20%
-  // ===============================
-
-  if (macdHist > 0) {
-    momentumScore += 7;
-    reasons.push("MACD histogram is positive.");
-  } else {
-    momentumScore -= 7;
-    warnings.push("MACD histogram is negative.");
-  }
-
-  if (macdHistRising) {
-    momentumScore += 4;
-    reasons.push("MACD histogram is rising.");
-  } else {
-    momentumScore -= 3;
-    warnings.push("MACD histogram is weakening.");
-  }
-
-  if (macdBullCross) {
-    momentumScore += 5;
-    reasons.push("MACD bullish crossover detected.");
-  }
-
-  if (macdBearCross) {
-    momentumScore -= 5;
-    warnings.push("MACD bearish crossover detected.");
-  }
-
-  if (rsi >= 45 && rsi <= 65) {
-    momentumScore += 4;
-    reasons.push("RSI is in a healthy bullish range.");
-  } else if (rsi > 70) {
-    momentumScore -= 4;
-    warnings.push("RSI is overbought.");
-  } else if (rsi < 35) {
-    momentumScore -= 5;
-    warnings.push("RSI is weak or oversold.");
-  }
-
-  momentumScore = clamp(momentumScore, -20, 20);
-
-  // ===============================
-  // 3. ACCUMULATION / INSTITUTIONAL PROXY: 20%
-  // ===============================
-
-  if (volumeSpike && price > ema50) {
-    accumulationScore += 6;
-    reasons.push("Volume spike supports buying pressure.");
-  }
-
-  if (obvBullish) {
-    accumulationScore += 8;
-    reasons.push("OBV is above its moving average, suggesting accumulation.");
-  }
-
-  if (breakoutAboveResistance && volumeSpike) {
-    accumulationScore += 6;
-    reasons.push("Price broke above resistance with strong volume.");
-  }
-
-  if (obvBearish) {
-    accumulationScore -= 8;
-    warnings.push("OBV is weakening, suggesting distribution.");
-  }
-
-  if (breakdownBelowSupport && volumeSpike) {
-    accumulationScore -= 12;
-    warnings.push("High-volume breakdown below support.");
-  }
-
-  accumulationScore = clamp(accumulationScore, -20, 20);
-
-  // ===============================
-  // 4. KDJ TIMING SCORE: 15%
-  // ===============================
-
-  if (kdjBullCross && k < 60 && d < 60) {
-    kdjScore += 8;
-    reasons.push("KDJ bullish cross from a non-overbought zone.");
-  } else if (kdjBullCross) {
-    kdjScore += 5;
-    reasons.push("KDJ bullish cross detected.");
-  }
-
-  if (jRising && j < 100) {
-    kdjScore += 4;
-    reasons.push("KDJ J-line is rising without being extremely stretched.");
-  }
-
-  if (k < 30 && d < 30 && kdjBullCross) {
-    kdjScore += 3;
-    reasons.push("KDJ is turning up from an oversold area.");
-  }
-
-  if (kdjBearCross) {
-    kdjScore -= 8;
-    warnings.push("KDJ bearish cross detected.");
-  }
-
-  if (k > 80 && d > 80 && j > 100) {
-    kdjScore -= 7;
-    warnings.push("KDJ is extremely overbought.");
-  }
-
-  kdjScore = clamp(kdjScore, -15, 15);
-
-  // ===============================
-  // 5. RELATIVE STRENGTH SCORE: 15%
-  // ===============================
-
-  if (
-    isValidNumber(relativeStrength) &&
-    isValidNumber(relativeStrengthMA50)
-  ) {
-    if (relativeStrength > relativeStrengthMA50) {
-      relativeStrengthScore += 15;
-      reasons.push("Relative strength is above its 50-day average.");
-    } else {
-      relativeStrengthScore -= 15;
-      warnings.push("Relative strength is weak versus benchmark.");
-    }
-  } else {
-    relativeStrengthScore = 0;
-    warnings.push("Relative strength data unavailable, treated as neutral.");
-  }
-
-  relativeStrengthScore = clamp(relativeStrengthScore, -15, 15);
-
-  // ===============================
-  // 6. RISK PENALTY
-  // ===============================
-
-  if (priceNearResistance && rsi > 65) {
-    riskPenalty += 7;
-    warnings.push("Price is near resistance while RSI is elevated.");
-  }
-
-  if (isValidNumber(atrPct) && atrPct > 6) {
-    riskPenalty += 5;
-    warnings.push("ATR is high, so volatility risk is elevated.");
-  }
-
-  if (price < ema200) {
-    riskPenalty += 6;
-    warnings.push("Price below EMA200 adds long-term trend risk.");
-  }
-
-  if (breakdownBelowSupport) {
-    riskPenalty += 8;
-    warnings.push("Price has broken below support.");
-  }
-
-  riskPenalty = clamp(riskPenalty, 0, 20);
-
-  // ===============================
-  // TECHNICAL SCORE
-  // ===============================
-
-  let technicalScore =
-    trendScore +
-    momentumScore +
-    accumulationScore +
-    kdjScore +
-    relativeStrengthScore -
-    riskPenalty;
-
-  technicalScore = clamp(technicalScore, -100, 100);
-
-  // ===============================
-  // TECHNICAL SIGNAL
-  // ===============================
-
-  const strongBuyGate =
-    price > ema50 &&
-    ema50 > ema200 &&
-    price > ema200 &&
-    macdHist > 0 &&
-    rsi >= 45 &&
-    rsi <= 70 &&
-    accumulationScore > 0 &&
-    !priceNearResistance;
-
-  const hardSellGate =
-    price < ema200 &&
-    ema50 < ema200 &&
-    macdHist < 0 &&
-    obvBearish;
-
-  const trimGate =
-    priceNearResistance &&
-    rsi > 70 &&
-    k > 80 &&
-    d > 80 &&
-    j > 100;
-
-  let technicalSignal = "Watch / Neutral";
-
-  if (hardSellGate || technicalScore <= -70) {
-    technicalSignal = "Strong Sell / Avoid";
-  } else if (technicalScore <= -41) {
-    technicalSignal = "Exit / Sell";
-  } else if (trimGate || technicalScore <= -21) {
-    technicalSignal = "Trim / Take Profit";
-  } else if (strongBuyGate && technicalScore >= 70) {
-    technicalSignal = "Strong Buy Setup";
-  } else if (technicalScore >= 40) {
-    technicalSignal = "Buy Setup";
-  } else {
-    technicalSignal = "Watch / Neutral";
-  }
-
-  // ===============================
-  // DCF VALUATION SIGNAL
-  // ===============================
-
-  let valuationSignal = "Valuation Unavailable";
-
-  if (dcfUpside !== null) {
-    if (dcfUpside >= 30) {
-      valuationSignal = "Undervalued";
-    } else if (dcfUpside >= 10) {
-      valuationSignal = "Attractive";
-    } else if (dcfUpside > -10) {
-      valuationSignal = "Fair Value";
-    } else if (dcfUpside > -30) {
-      valuationSignal = "Expensive";
-    } else {
-      valuationSignal = "Very Expensive";
-    }
-  }
-
-  // ===============================
-  // FINAL COMBINED READ
-  // ===============================
-
-  let finalRead = "Watch / Neutral";
-  let finalAction = "WAIT";
-
-  const bullishTechnical =
-    technicalSignal === "Strong Buy Setup" ||
-    technicalSignal === "Buy Setup";
-
-  const bearishTechnical =
-    technicalSignal === "Exit / Sell" ||
-    technicalSignal === "Strong Sell / Avoid";
-
-  const trimTechnical =
-    technicalSignal === "Trim / Take Profit";
-
-  const valuationGood =
-    valuationSignal === "Undervalued" ||
-    valuationSignal === "Attractive";
-
-  const valuationBad =
-    valuationSignal === "Expensive" ||
-    valuationSignal === "Very Expensive";
-
-  if (technicalSignal === "Strong Sell / Avoid") {
-    finalRead = "Strong Sell / Avoid";
-    finalAction = "SELL / AVOID";
-  } else if (bearishTechnical && valuationBad) {
-    finalRead = "Exit / Sell";
-    finalAction = "SELL";
-  } else if (bearishTechnical && valuationGood) {
-    finalRead = "Wait — Value Exists But Technicals Are Weak";
-    finalAction = "WAIT";
-  } else if (trimTechnical && valuationBad) {
-    finalRead = "Trim / Take Profit";
-    finalAction = "TRIM";
-  } else if (trimTechnical && valuationGood) {
-    finalRead = "Hold / Do Not Chase";
-    finalAction = "HOLD";
-  } else if (bullishTechnical && valuationGood) {
-    finalRead =
-      technicalSignal === "Strong Buy Setup"
-        ? "Strong Buy Setup"
-        : "Buy Setup";
-    finalAction = "BUY";
-  } else if (bullishTechnical && valuationSignal === "Fair Value") {
-    finalRead = "Buy Setup / Starter Position";
-    finalAction = "STARTER BUY";
-  } else if (bullishTechnical && valuationBad) {
-    finalRead = "Momentum Setup Only — Do Not Chase Long Term";
-    finalAction = "WATCH";
-  } else if (technicalSignal === "Watch / Neutral" && valuationGood) {
-    finalRead = "Watch For Entry";
-    finalAction = "WAIT FOR TECHNICAL CONFIRMATION";
-  } else {
-    finalRead = "Watch / Neutral";
-    finalAction = "WAIT";
-  }
-
-  // ===============================
-  // CONFIDENCE
-  // ===============================
-
-  const confidence = Math.round(Math.abs(technicalScore));
-
-  return {
-    finalRead,
-    finalAction,
-
-    technicalSignal,
-    technicalScore,
-    confidence,
-
-    valuationSignal,
-    dcfUpsidePct: dcfUpside,
-
-    breakdown: {
-      trendScore,
-      momentumScore,
-      accumulationScore,
-      kdjScore,
-      relativeStrengthScore,
-      riskPenalty
-    },
-
-    reasons,
-    warnings
   };
 }
 
@@ -1700,10 +1023,230 @@ function LevelTable({
 }
 
 // ----------------------------- main -----------------------------
-function FinalReadCard({
-  sig,
-  c
+
+// ===============================
+// EQUITY TERMINAL FINAL SIGNAL ENGINE
+// ===============================
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function isValidNumber(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function normalizePct(value) {
+  if (!isValidNumber(value)) return null;
+  return Math.abs(value) <= 2 ? value * 100 : value;
+}
+
+function getFinalBuySellSignal({
+  price, ema50, ema200,
+  rsi, macd, macdSignal, macdHist, prevMacd, prevMacdSignal, prevMacdHist,
+  k, d, j, prevK, prevD, prevJ,
+  volume, avgVolume20, obv, obvMA20,
+  support, resistance,
+  relativeStrength, relativeStrengthMA50,
+  atrPct, dcfUpsidePct
 }) {
+  const reasons = [];
+  const warnings = [];
+  let trendScore = 0;
+  let momentumScore = 0;
+  let accumulationScore = 0;
+  let kdjScore = 0;
+  let relativeStrengthScore = 0;
+  let riskPenalty = 0;
+  const dcfUpside = normalizePct(dcfUpsidePct);
+  const macdBullCross = isValidNumber(prevMacd) && isValidNumber(prevMacdSignal) && prevMacd <= prevMacdSignal && macd > macdSignal;
+  const macdBearCross = isValidNumber(prevMacd) && isValidNumber(prevMacdSignal) && prevMacd >= prevMacdSignal && macd < macdSignal;
+  const kdjBullCross = isValidNumber(prevK) && isValidNumber(prevD) && prevK <= prevD && k > d;
+  const kdjBearCross = isValidNumber(prevK) && isValidNumber(prevD) && prevK >= prevD && k < d;
+  const macdHistRising = isValidNumber(prevMacdHist) && macdHist > prevMacdHist;
+  const jRising = isValidNumber(prevJ) && j > prevJ;
+  const volumeSpike = isValidNumber(volume) && isValidNumber(avgVolume20) && volume > avgVolume20 * 1.5;
+  const obvBullish = isValidNumber(obv) && isValidNumber(obvMA20) && obv > obvMA20;
+  const obvBearish = isValidNumber(obv) && isValidNumber(obvMA20) && obv < obvMA20;
+  const priceNearSupport = isValidNumber(support) && Math.abs(price - support) / price < 0.04;
+  const priceNearResistance = isValidNumber(resistance) && Math.abs(price - resistance) / price < 0.04;
+  const breakoutAboveResistance = isValidNumber(resistance) && price > resistance;
+  const breakdownBelowSupport = isValidNumber(support) && price < support;
+
+  // 1. TREND SCORE: 30%
+  if (price > ema50) { trendScore += 10; reasons.push("Price is above EMA50."); } else { trendScore -= 10; warnings.push("Price is below EMA50."); }
+  if (ema50 > ema200) { trendScore += 12; reasons.push("EMA50 is above EMA200, showing a positive trend."); } else { trendScore -= 12; warnings.push("EMA50 is below EMA200, showing a weak trend."); }
+  if (price > ema200) { trendScore += 8; reasons.push("Price is above EMA200."); } else { trendScore -= 8; warnings.push("Price is below EMA200."); }
+  trendScore = clamp(trendScore, -30, 30);
+
+  // 2. MOMENTUM SCORE: 20%
+  if (macdHist > 0) { momentumScore += 7; reasons.push("MACD histogram is positive."); } else { momentumScore -= 7; warnings.push("MACD histogram is negative."); }
+  if (macdHistRising) { momentumScore += 4; reasons.push("MACD histogram is rising."); } else { momentumScore -= 3; warnings.push("MACD histogram is weakening."); }
+  if (macdBullCross) { momentumScore += 5; reasons.push("MACD bullish crossover detected."); }
+  if (macdBearCross) { momentumScore -= 5; warnings.push("MACD bearish crossover detected."); }
+  if (rsi >= 45 && rsi <= 65) { momentumScore += 4; reasons.push("RSI is in a healthy bullish range."); } else if (rsi > 70) { momentumScore -= 4; warnings.push("RSI is overbought."); } else if (rsi < 35) { momentumScore -= 5; warnings.push("RSI is weak or oversold."); }
+  momentumScore = clamp(momentumScore, -20, 20);
+
+  // 3. ACCUMULATION: 20%
+  if (volumeSpike && price > ema50) { accumulationScore += 6; reasons.push("Volume spike supports buying pressure."); }
+  if (obvBullish) { accumulationScore += 8; reasons.push("OBV is above its moving average, suggesting accumulation."); }
+  if (breakoutAboveResistance && volumeSpike) { accumulationScore += 6; reasons.push("Price broke above resistance with strong volume."); }
+  if (obvBearish) { accumulationScore -= 8; warnings.push("OBV is weakening, suggesting distribution."); }
+  if (breakdownBelowSupport && volumeSpike) { accumulationScore -= 12; warnings.push("High-volume breakdown below support."); }
+  accumulationScore = clamp(accumulationScore, -20, 20);
+
+  // 4. KDJ TIMING: 15%
+  if (kdjBullCross && k < 60 && d < 60) { kdjScore += 8; reasons.push("KDJ bullish cross from a non-overbought zone."); } else if (kdjBullCross) { kdjScore += 5; reasons.push("KDJ bullish cross detected."); }
+  if (jRising && j < 100) { kdjScore += 4; reasons.push("KDJ J-line is rising without being extremely stretched."); }
+  if (k < 30 && d < 30 && kdjBullCross) { kdjScore += 3; reasons.push("KDJ is turning up from an oversold area."); }
+  if (kdjBearCross) { kdjScore -= 8; warnings.push("KDJ bearish cross detected."); }
+  if (k > 80 && d > 80 && j > 100) { kdjScore -= 7; warnings.push("KDJ is extremely overbought."); }
+  kdjScore = clamp(kdjScore, -15, 15);
+
+  // 5. RELATIVE STRENGTH: 15%
+  if (isValidNumber(relativeStrength) && isValidNumber(relativeStrengthMA50)) {
+    if (relativeStrength > relativeStrengthMA50) { relativeStrengthScore += 15; reasons.push("Relative strength is above its 50-day average."); }
+    else { relativeStrengthScore -= 15; warnings.push("Relative strength is weak versus benchmark."); }
+  } else { relativeStrengthScore = 0; warnings.push("Relative strength data unavailable, treated as neutral."); }
+  relativeStrengthScore = clamp(relativeStrengthScore, -15, 15);
+
+  // 6. RISK PENALTY
+  if (priceNearResistance && rsi > 65) { riskPenalty += 7; warnings.push("Price is near resistance while RSI is elevated."); }
+  if (isValidNumber(atrPct) && atrPct > 6) { riskPenalty += 5; warnings.push("ATR is high, so volatility risk is elevated."); }
+  if (price < ema200) { riskPenalty += 6; warnings.push("Price below EMA200 adds long-term trend risk."); }
+  if (breakdownBelowSupport) { riskPenalty += 8; warnings.push("Price has broken below support."); }
+  riskPenalty = clamp(riskPenalty, 0, 20);
+
+  let technicalScore = trendScore + momentumScore + accumulationScore + kdjScore + relativeStrengthScore - riskPenalty;
+  technicalScore = clamp(technicalScore, -100, 100);
+
+  const strongBuyGate = price > ema50 && ema50 > ema200 && price > ema200 && macdHist > 0 && rsi >= 45 && rsi <= 70 && accumulationScore > 0 && !priceNearResistance;
+  const hardSellGate = price < ema200 && ema50 < ema200 && macdHist < 0 && obvBearish;
+  const trimGate = priceNearResistance && rsi > 70 && k > 80 && d > 80 && j > 100;
+  let technicalSignal = "Watch / Neutral";
+  if (hardSellGate || technicalScore <= -70) technicalSignal = "Strong Sell / Avoid";
+  else if (technicalScore <= -41) technicalSignal = "Exit / Sell";
+  else if (trimGate || technicalScore <= -21) technicalSignal = "Trim / Take Profit";
+  else if (strongBuyGate && technicalScore >= 70) technicalSignal = "Strong Buy Setup";
+  else if (technicalScore >= 40) technicalSignal = "Buy Setup";
+
+  let valuationSignal = "Valuation Unavailable";
+  if (dcfUpside !== null) {
+    if (dcfUpside >= 30) valuationSignal = "Undervalued";
+    else if (dcfUpside >= 10) valuationSignal = "Attractive";
+    else if (dcfUpside > -10) valuationSignal = "Fair Value";
+    else if (dcfUpside > -30) valuationSignal = "Expensive";
+    else valuationSignal = "Very Expensive";
+  }
+
+  let finalRead = "Watch / Neutral", finalAction = "WAIT";
+  const bullishTechnical = technicalSignal === "Strong Buy Setup" || technicalSignal === "Buy Setup";
+  const bearishTechnical = technicalSignal === "Exit / Sell" || technicalSignal === "Strong Sell / Avoid";
+  const trimTechnical = technicalSignal === "Trim / Take Profit";
+  const valuationGood = valuationSignal === "Undervalued" || valuationSignal === "Attractive";
+  const valuationBad = valuationSignal === "Expensive" || valuationSignal === "Very Expensive";
+  if (technicalSignal === "Strong Sell / Avoid") { finalRead = "Strong Sell / Avoid"; finalAction = "SELL / AVOID"; }
+  else if (bearishTechnical && valuationBad) { finalRead = "Exit / Sell"; finalAction = "SELL"; }
+  else if (bearishTechnical && valuationGood) { finalRead = "Wait — Value Exists But Technicals Are Weak"; finalAction = "WAIT"; }
+  else if (trimTechnical && valuationBad) { finalRead = "Trim / Take Profit"; finalAction = "TRIM"; }
+  else if (trimTechnical && valuationGood) { finalRead = "Hold / Do Not Chase"; finalAction = "HOLD"; }
+  else if (bullishTechnical && valuationGood) { finalRead = technicalSignal === "Strong Buy Setup" ? "Strong Buy Setup" : "Buy Setup"; finalAction = "BUY"; }
+  else if (bullishTechnical && valuationSignal === "Fair Value") { finalRead = "Buy Setup / Starter Position"; finalAction = "STARTER BUY"; }
+  else if (bullishTechnical && valuationBad) { finalRead = "Momentum Setup Only — Do Not Chase Long Term"; finalAction = "WATCH"; }
+  else if (technicalSignal === "Watch / Neutral" && valuationGood) { finalRead = "Watch For Entry"; finalAction = "WAIT FOR TECHNICAL CONFIRMATION"; }
+
+  return {
+    finalRead, finalAction, technicalSignal, technicalScore,
+    confidence: Math.round(Math.abs(technicalScore)),
+    valuationSignal, dcfUpsidePct: dcfUpside,
+    breakdown: { trendScore, momentumScore, accumulationScore, kdjScore, relativeStrengthScore, riskPenalty },
+    reasons, warnings
+  };
+}
+
+// ---- improved backtest using the multi-factor engine ----
+function backtestEngine(data, ind, opts) {
+  const o = opts || {};
+  const feePerSide = o.feePerSide != null ? o.feePerSide : 0.001;
+  const atrStopMult = o.atrStopMult != null ? o.atrStopMult : 2;
+  const atrTrailMult = o.atrTrailMult != null ? o.atrTrailMult : 2.5;
+  const n = data.length;
+  const out = { stratRet: 0, bh: 0, trades: 0, winRate: 0, avgWin: 0, avgLoss: 0, profitFactor: null, expectancy: 0, maxDD: 0, timeInMarket: 0, sharpe: null, feesIncluded: true, valid: false };
+  if (n < 30) return out;
+  const cl = data.map(b => b.close);
+  const e200 = ema(cl, 200);
+  const e50 = ind.ema50;
+  const vols = data.map(b => b.volume || 0);
+  const rollMean = (arr, i, w) => { const s = arr.slice(Math.max(0, i-w+1), i+1); return s.length ? s.reduce((a,b)=>a+b,0)/s.length : null; };
+  const scoreAt = (i) => {
+    if (i < 1) return null;
+    const price = cl[i];
+    const atrAbs = ind.atr[i];
+    return getFinalBuySellSignal({
+      price, ema50: e50[i], ema200: e200[i], rsi: ind.rsi[i],
+      macd: ind.macd.line[i], macdSignal: ind.macd.signal[i], macdHist: ind.macd.hist[i],
+      prevMacd: ind.macd.line[i-1], prevMacdSignal: ind.macd.signal[i-1], prevMacdHist: ind.macd.hist[i-1],
+      k: ind.stoch.k[i], d: ind.stoch.d[i], j: ind.stoch.j[i],
+      prevK: ind.stoch.k[i-1], prevD: ind.stoch.d[i-1], prevJ: ind.stoch.j[i-1],
+      volume: vols[i], avgVolume20: rollMean(vols, i, 20),
+      obv: ind.obv[i], obvMA20: rollMean(ind.obv, i, 20),
+      support: null, resistance: null, relativeStrength: undefined, relativeStrengthMA50: undefined,
+      atrPct: atrAbs != null && price ? atrAbs / price * 100 : null,
+      dcfUpsidePct: undefined
+    });
+  };
+  let pos = false, entry = 0, entryATR = 0, peak = 0, barsIn = 0, eq = 1;
+  const rets = [], equityCurve = [1];
+  const closeTrade = (exitPx) => {
+    const gross = exitPx / entry;
+    const net = gross * (1 - feePerSide) * (1 - feePerSide);
+    eq *= net; rets.push(net - 1); equityCurve.push(eq); pos = false;
+  };
+  for (let i = 1; i < n; i++) {
+    const sig = scoreAt(i);
+    if (!sig) continue;
+    const price = cl[i], atrAbs = ind.atr[i] || 0;
+    if (!pos) {
+      if (sig.technicalScore >= 40 && (e200[i] == null || price > e200[i])) {
+        pos = true; entry = price; entryATR = atrAbs; peak = price; barsIn = 1;
+      }
+    } else {
+      barsIn++;
+      if (price > peak) peak = price;
+      const trailStop = peak - atrTrailMult * atrAbs;
+      const hardStop = entry - atrStopMult * entryATR;
+      const stopHit = price <= trailStop || price <= hardStop;
+      const weakExit = sig.technicalScore < 0 || (e50[i] != null && price < e50[i]) ||
+        sig.technicalSignal === "Exit / Sell" || sig.technicalSignal === "Strong Sell / Avoid" ||
+        sig.technicalSignal === "Trim / Take Profit";
+      if (stopHit || weakExit) closeTrade(price);
+    }
+  }
+  if (pos) closeTrade(cl[n-1]);
+  const wins = rets.filter(r => r > 0), losses = rets.filter(r => r <= 0);
+  const sum = a => a.reduce((x,y)=>x+y, 0);
+  const grossWin = sum(wins), grossLoss = Math.abs(sum(losses));
+  let pk = equityCurve[0], maxDD = 0;
+  for (const v of equityCurve) { if (v > pk) pk = v; const dd = v/pk - 1; if (dd < maxDD) maxDD = dd; }
+  let sharpe = null;
+  if (rets.length > 1) {
+    const m = sum(rets)/rets.length;
+    const sd = Math.sqrt(sum(rets.map(r=>(r-m)**2))/(rets.length-1));
+    sharpe = sd > 0 ? m/sd : null;
+  }
+  out.stratRet = eq - 1; out.bh = cl[n-1]/cl[0] - 1; out.trades = rets.length;
+  out.winRate = rets.length ? wins.length/rets.length : 0;
+  out.avgWin = wins.length ? grossWin/wins.length : 0;
+  out.avgLoss = losses.length ? sum(losses)/losses.length : 0;
+  out.profitFactor = grossLoss > 0 ? grossWin/grossLoss : (grossWin > 0 ? Infinity : null);
+  out.expectancy = rets.length ? sum(rets)/rets.length : 0;
+  out.maxDD = maxDD; out.timeInMarket = n > 1 ? barsIn/(n-1) : 0;
+  out.sharpe = sharpe; out.valid = true;
+  return out;
+}
+
+// ---- React components ----
+function FinalReadCard({ sig, c }) {
   const accentFor = action => {
     if (action === "BUY" || action === "STARTER BUY") return c.green;
     if (action === "SELL" || action === "SELL / AVOID") return c.red;
@@ -1713,470 +1256,1362 @@ function FinalReadCard({
   };
   const accent = accentFor(sig.finalAction);
   const scoreColor = sig.technicalScore > 0 ? c.green : sig.technicalScore < 0 ? c.red : c.mut;
-  const valColor = sig.valuationSignal === "Undervalued" || sig.valuationSignal === "Attractive" ? c.green : sig.valuationSignal === "Expensive" || sig.valuationSignal === "Very Expensive" ? c.red : sig.valuationSignal === "Fair Value" ? c.gold : c.mut;
-  const chip = (label, value, color) => /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      flexDirection: "column",
-      gap: 2,
-      minWidth: 90
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 10,
-      letterSpacing: ".06em",
-      textTransform: "uppercase",
-      color: c.mut
-    }
-  }, label), /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 13,
-      fontWeight: 600,
-      color: color || c.ink
-    }
-  }, value));
+  const valColor = sig.valuationSignal === "Undervalued" || sig.valuationSignal === "Attractive" ? c.green
+    : sig.valuationSignal === "Expensive" || sig.valuationSignal === "Very Expensive" ? c.red
+    : sig.valuationSignal === "Fair Value" ? c.gold : c.mut;
+  const chip = (label, value, color) => React.createElement("div", { style: { display:"flex", flexDirection:"column", gap:2, minWidth:90 } },
+    React.createElement("span", { style: { fontSize:10, letterSpacing:".06em", textTransform:"uppercase", color:c.mut } }, label),
+    React.createElement("span", { style: { fontSize:13, fontWeight:600, color:color||c.ink } }, value));
   const bd = sig.breakdown;
   const bdRow = (label, val, max) => {
     const col = val > 0 ? c.green : val < 0 ? c.red : c.mut;
-    return /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-        gap: 8,
-        fontSize: 12
-      }
-    }, /*#__PURE__*/React.createElement("span", {
-      style: {
-        color: c.mut
-      }
-    }, label), /*#__PURE__*/React.createElement("span", {
-      style: {
-        color: col,
-        fontWeight: 600,
-        fontVariantNumeric: "tabular-nums"
-      }
-    }, val > 0 ? "+" : "", val, /*#__PURE__*/React.createElement("span", {
-      style: {
-        color: c.mut,
-        fontWeight: 400
-      }
-    }, " / ", max)));
+    return React.createElement("div", { style: { display:"flex", alignItems:"center", justifyContent:"space-between", gap:8, fontSize:12 } },
+      React.createElement("span", { style: { color:c.mut } }, label),
+      React.createElement("span", { style: { color:col, fontWeight:600, fontVariantNumeric:"tabular-nums" } },
+        val > 0 ? "+" : "", val,
+        React.createElement("span", { style: { color:c.mut, fontWeight:400 } }, " / ", max)));
   };
-
-  // technical score bar: map -100..100 -> 0..100% with center at 50%
-  const pct = Math.max(0, Math.min(100, (sig.technicalScore + 100) / 2));
-  return /*#__PURE__*/React.createElement("div", {
-    style: {
-      border: "1px solid " + c.line,
-      borderLeft: "3px solid " + accent,
-      background: c.panel2,
-      borderRadius: 8,
-      padding: 16,
-      marginBottom: 18
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      alignItems: "baseline",
-      justifyContent: "space-between",
-      flexWrap: "wrap",
-      gap: 8
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      alignItems: "baseline",
-      gap: 10,
-      flexWrap: "wrap"
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 10,
-      letterSpacing: ".14em",
-      textTransform: "uppercase",
-      color: c.gold
-    }
-  }, "Final read"), /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 18,
-      fontWeight: 700,
-      color: accent
-    }
-  }, sig.finalRead)), /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 11,
-      fontWeight: 700,
-      letterSpacing: ".08em",
-      color: accent,
-      border: "1px solid " + accent,
-      borderRadius: 999,
-      padding: "3px 10px",
-      whiteSpace: "nowrap"
-    }
-  }, sig.finalAction)), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      flexWrap: "wrap",
-      gap: 18,
-      marginTop: 14
-    }
-  }, chip("Technical", sig.technicalSignal, scoreColor), chip("Valuation", sig.valuationSignal, valColor), chip("DCF upside", sig.dcfUpsidePct !== null ? sig.dcfUpsidePct.toFixed(1) + "%" : "N/A", sig.dcfUpsidePct !== null ? sig.dcfUpsidePct >= 0 ? c.green : c.red : c.mut), chip("Score", sig.technicalScore + " / 100", scoreColor)), /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginTop: 12
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      height: 6,
-      borderRadius: 999,
-      background: c.line,
-      position: "relative",
-      overflow: "hidden"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      position: "absolute",
-      left: "50%",
-      top: 0,
-      bottom: 0,
-      width: 1,
-      background: c.mut,
-      opacity: .6
-    }
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      position: "absolute",
-      top: 0,
-      bottom: 0,
-      left: sig.technicalScore >= 0 ? "50%" : pct + "%",
-      width: Math.abs(sig.technicalScore) / 2 + "%",
-      background: scoreColor,
-      borderRadius: 999
-    }
-  })), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      color: c.mut,
-      marginTop: 5
-    }
-  }, "Mechanical multi-factor score (strength ", sig.confidence, "/100) \u2014 a weighting of the signals below, not a probability or price prediction. Technicals gauge timing; DCF gauges long-term value.")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: "repeat(auto-fit, minmax(128px, 1fr))",
-      gap: "8px 16px",
-      marginTop: 14,
-      paddingTop: 12,
-      borderTop: "1px solid " + c.line
-    }
-  }, bdRow("Trend", bd.trendScore, 30), bdRow("Momentum", bd.momentumScore, 20), bdRow("Accumulation", bd.accumulationScore, 20), bdRow("KDJ timing", bd.kdjScore, 15), bdRow("Relative strength", bd.relativeStrengthScore, 15), bdRow("Risk penalty", -bd.riskPenalty, 0)), (sig.reasons.length > 0 || sig.warnings.length > 0) && /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-      gap: 16,
-      marginTop: 14
-    }
-  }, sig.reasons.length > 0 && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      letterSpacing: ".08em",
-      textTransform: "uppercase",
-      color: c.green,
-      marginBottom: 6
-    }
-  }, "Supporting"), /*#__PURE__*/React.createElement("ul", {
-    style: {
-      margin: 0,
-      padding: 0,
-      listStyle: "none",
-      display: "flex",
-      flexDirection: "column",
-      gap: 4
-    }
-  }, sig.reasons.map((r, i) => /*#__PURE__*/React.createElement("li", {
-    key: i,
-    style: {
-      fontSize: 12,
-      color: c.ink,
-      lineHeight: 1.4
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: {
-      color: c.green,
-      marginRight: 6
-    }
-  }, "\u2713"), r)))), sig.warnings.length > 0 && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      letterSpacing: ".08em",
-      textTransform: "uppercase",
-      color: c.gold,
-      marginBottom: 6
-    }
-  }, "Caution"), /*#__PURE__*/React.createElement("ul", {
-    style: {
-      margin: 0,
-      padding: 0,
-      listStyle: "none",
-      display: "flex",
-      flexDirection: "column",
-      gap: 4
-    }
-  }, sig.warnings.map((w, i) => /*#__PURE__*/React.createElement("li", {
-    key: i,
-    style: {
-      fontSize: 12,
-      color: c.ink,
-      lineHeight: 1.4
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: {
-      color: c.gold,
-      marginRight: 6
-    }
-  }, "\u26A0"), w))))));
+  const barPct = Math.max(0, Math.min(100, (sig.technicalScore + 100) / 2));
+  return React.createElement("div", { style: { border:"1px solid "+c.line, borderLeft:"3px solid "+accent, background:c.panel2, borderRadius:8, padding:16, marginBottom:18 } },
+    React.createElement("div", { style: { display:"flex", alignItems:"baseline", justifyContent:"space-between", flexWrap:"wrap", gap:8 } },
+      React.createElement("div", { style: { display:"flex", alignItems:"baseline", gap:10, flexWrap:"wrap" } },
+        React.createElement("span", { style: { fontSize:10, letterSpacing:".14em", textTransform:"uppercase", color:c.gold } }, "Final read"),
+        React.createElement("span", { style: { fontSize:18, fontWeight:700, color:accent } }, sig.finalRead)),
+      React.createElement("span", { style: { fontSize:11, fontWeight:700, letterSpacing:".08em", color:accent, border:"1px solid "+accent, borderRadius:999, padding:"3px 10px", whiteSpace:"nowrap" } }, sig.finalAction)),
+    React.createElement("div", { style: { display:"flex", flexWrap:"wrap", gap:18, marginTop:14 } },
+      chip("Technical", sig.technicalSignal, scoreColor),
+      chip("Valuation", sig.valuationSignal, valColor),
+      chip("DCF upside", sig.dcfUpsidePct !== null ? sig.dcfUpsidePct.toFixed(1)+"%" : "N/A", sig.dcfUpsidePct !== null ? sig.dcfUpsidePct >= 0 ? c.green : c.red : c.mut),
+      chip("Score", sig.technicalScore+" / 100", scoreColor)),
+    React.createElement("div", { style: { marginTop:12 } },
+      React.createElement("div", { style: { height:6, borderRadius:999, background:c.line, position:"relative", overflow:"hidden" } },
+        React.createElement("div", { style: { position:"absolute", left:"50%", top:0, bottom:0, width:1, background:c.mut, opacity:.6 } }),
+        React.createElement("div", { style: { position:"absolute", top:0, bottom:0, left:sig.technicalScore>=0?"50%":barPct+"%", width:Math.abs(sig.technicalScore)/2+"%", background:scoreColor, borderRadius:999 } })),
+      React.createElement("div", { style: { fontSize:10, color:c.mut, marginTop:5 } },
+        "Mechanical multi-factor score (strength "+sig.confidence+"/100) — a weighting of the signals below, not a probability or price prediction. Technicals gauge timing; DCF gauges long-term value.")),
+    React.createElement("div", { style: { display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(128px, 1fr))", gap:"8px 16px", marginTop:14, paddingTop:12, borderTop:"1px solid "+c.line } },
+      bdRow("Trend", bd.trendScore, 30),
+      bdRow("Momentum", bd.momentumScore, 20),
+      bdRow("Accumulation", bd.accumulationScore, 20),
+      bdRow("KDJ timing", bd.kdjScore, 15),
+      bdRow("Relative strength", bd.relativeStrengthScore, 15),
+      bdRow("Risk penalty", -bd.riskPenalty, 0)),
+    (sig.reasons.length > 0 || sig.warnings.length > 0) && React.createElement("div", { style: { display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(220px, 1fr))", gap:16, marginTop:14 } },
+      sig.reasons.length > 0 && React.createElement("div", null,
+        React.createElement("div", { style: { fontSize:10, letterSpacing:".08em", textTransform:"uppercase", color:c.green, marginBottom:6 } }, "Supporting"),
+        React.createElement("ul", { style: { margin:0, padding:0, listStyle:"none", display:"flex", flexDirection:"column", gap:4 } },
+          sig.reasons.map((r,i) => React.createElement("li", { key:i, style: { fontSize:12, color:c.ink, lineHeight:1.4 } },
+            React.createElement("span", { style: { color:c.green, marginRight:6 } }, "✓"), r)))),
+      sig.warnings.length > 0 && React.createElement("div", null,
+        React.createElement("div", { style: { fontSize:10, letterSpacing:".08em", textTransform:"uppercase", color:c.gold, marginBottom:6 } }, "Caution"),
+        React.createElement("ul", { style: { margin:0, padding:0, listStyle:"none", display:"flex", flexDirection:"column", gap:4 } },
+          sig.warnings.map((w,i) => React.createElement("li", { key:i, style: { fontSize:12, color:c.ink, lineHeight:1.4 } },
+            React.createElement("span", { style: { color:c.gold, marginRight:6 } }, "⚠"), w))))));
 }
 
-function BacktestCard({
-  bt,
-  c,
-  pct
-}) {
-  if (!bt || !bt.valid) {
-    return /*#__PURE__*/React.createElement("div", {
-      style: {
-        fontSize: 11,
-        color: c.mut,
-        marginTop: 6
-      }
-    }, "Backtest needs more bars (\u226530) to run the multi-factor strategy.");
-  }
+function BacktestCard({ bt, c, pct }) {
+  if (!bt || !bt.valid) return React.createElement("div", { style: { fontSize:11, color:c.mut, marginTop:6 } }, "Backtest needs more bars (≥30) to run the multi-factor strategy.");
   const num = (x, dp) => x == null ? "—" : x === Infinity ? "∞" : x.toFixed(dp == null ? 2 : dp);
   const beat = bt.stratRet > bt.bh;
-  const cell = (label, value, color) => /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      flexDirection: "column",
-      gap: 2
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 9,
-      letterSpacing: ".05em",
-      textTransform: "uppercase",
-      color: c.mut
-    }
-  }, label), /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 13,
-      fontWeight: 600,
-      color: color || c.ink,
-      fontVariantNumeric: "tabular-nums"
-    }
-  }, value));
-  return /*#__PURE__*/React.createElement("div", {
-    style: {
-      marginTop: 10,
-      paddingTop: 10,
-      borderTop: "1px solid " + c.line
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      letterSpacing: ".08em",
-      textTransform: "uppercase",
-      color: c.gold,
-      marginBottom: 8
-    }
-  }, "Backtest \xB7 multi-factor engine"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: "repeat(auto-fit, minmax(86px, 1fr))",
-      gap: "10px 16px"
-    }
-  }, cell("Strategy", pct(bt.stratRet), bt.stratRet >= 0 ? c.green : c.red), cell("Buy & hold", pct(bt.bh), bt.bh >= 0 ? c.green : c.red), cell("Edge vs B&H", pct(bt.stratRet - bt.bh), beat ? c.green : c.red), cell("Max drawdown", pct(bt.maxDD), c.red), cell("Win rate", pct(bt.winRate, 0), c.ink), cell("Profit factor", num(bt.profitFactor), bt.profitFactor != null && bt.profitFactor >= 1 ? c.green : c.red), cell("Expectancy/trade", pct(bt.expectancy), bt.expectancy >= 0 ? c.green : c.red), cell("Avg win", pct(bt.avgWin), c.green), cell("Avg loss", pct(bt.avgLoss), c.red), cell("Trades", String(bt.trades), c.ink), cell("Time in market", pct(bt.timeInMarket, 0), c.ink), cell("Sharpe (per-trade)", num(bt.sharpe), c.ink)), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      color: c.mut,
-      marginTop: 8,
-      lineHeight: 1.45
-    }
-  }, "Entry: score \u2265 40 & price > EMA200. Exit: score < 0, close < EMA50, or a 2.5\xD7ATR trailing / 2\xD7ATR hard stop. Costs: 0.2% round-trip. ", /*#__PURE__*/React.createElement("b", null, "In-sample, close-to-close fills \u2014 hypothetical, not proof of future results."), " Win rate alone is misleading; weigh it against profit factor and expectancy."));
+  const cell = (label, value, color) => React.createElement("div", { style: { display:"flex", flexDirection:"column", gap:2 } },
+    React.createElement("span", { style: { fontSize:9, letterSpacing:".05em", textTransform:"uppercase", color:c.mut } }, label),
+    React.createElement("span", { style: { fontSize:13, fontWeight:600, color:color||c.ink, fontVariantNumeric:"tabular-nums" } }, value));
+  return React.createElement("div", { style: { marginTop:10, paddingTop:10, borderTop:"1px solid "+c.line } },
+    React.createElement("div", { style: { fontSize:10, letterSpacing:".08em", textTransform:"uppercase", color:c.gold, marginBottom:8 } }, "Backtest · multi-factor engine"),
+    React.createElement("div", { style: { display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(86px, 1fr))", gap:"10px 16px" } },
+      cell("Strategy", pct(bt.stratRet), bt.stratRet>=0?c.green:c.red),
+      cell("Buy & hold", pct(bt.bh), bt.bh>=0?c.green:c.red),
+      cell("Edge vs B&H", pct(bt.stratRet - bt.bh), beat?c.green:c.red),
+      cell("Max drawdown", pct(bt.maxDD), c.red),
+      cell("Win rate", pct(bt.winRate, 0), c.ink),
+      cell("Profit factor", num(bt.profitFactor), bt.profitFactor!=null&&bt.profitFactor>=1?c.green:c.red),
+      cell("Expectancy/trade", pct(bt.expectancy), bt.expectancy>=0?c.green:c.red),
+      cell("Avg win", pct(bt.avgWin), c.green),
+      cell("Avg loss", pct(bt.avgLoss), c.red),
+      cell("Trades", String(bt.trades), c.ink),
+      cell("Time in market", pct(bt.timeInMarket, 0), c.ink),
+      cell("Sharpe (per-trade)", num(bt.sharpe), c.ink)),
+    React.createElement("div", { style: { fontSize:10, color:c.mut, marginTop:8, lineHeight:1.45 } },
+      "Entry: score ≥ 40 & price > EMA200. Exit: score < 0, close < EMA50, or a 2.5×ATR trailing / 2×ATR hard stop. Costs: 0.2% round-trip. ",
+      React.createElement("b", null, "In-sample, close-to-close fills — hypothetical, not proof of future results."),
+      " Win rate alone is misleading; weigh it against profit factor and expectancy."));
 }
 
-function DcfInsightCard({
-  dcf,
-  c,
-  pct
-}) {
+function DcfInsightCard({ dcf, c, pct }) {
   const money = x => x == null ? "—" : "$" + x.toFixed(2);
   const tvHot = dcf.tvWeight != null && dcf.tvWeight > 0.8;
-  const cell = (label, value, color) => /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      flexDirection: "column",
-      gap: 2
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 9,
-      letterSpacing: ".05em",
-      textTransform: "uppercase",
-      color: c.mut
-    }
-  }, label), /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 14,
-      fontWeight: 600,
-      color: color || c.ink,
-      fontVariantNumeric: "tabular-nums"
-    }
-  }, value));
-  return /*#__PURE__*/React.createElement("div", {
-    style: {
-      border: "1px solid " + c.line,
-      borderLeft: "3px solid " + c.gold,
-      background: c.panel2,
-      borderRadius: 8,
-      padding: 16,
-      marginBottom: 18
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      letterSpacing: ".12em",
-      textTransform: "uppercase",
-      color: c.gold,
-      marginBottom: 12
-    }
-  }, "Your DCF \xB7 intrinsic value"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))",
-      gap: "12px 18px"
-    }
-  }, cell("Intrinsic / share (perpetuity)", money(dcf.perShare), dcf.valid ? c.ink : c.mut), cell("Upside vs price", dcf.valid ? pct(dcf.upside) : "—", dcf.valid ? dcf.upside >= 0 ? c.green : c.red : c.mut), cell("Buy below (margin of safety)", money(dcf.buyBelow), c.blue), cell("Terminal value % of EV", dcf.tvWeight != null ? pct(dcf.tvWeight, 0) : "—", tvHot ? c.red : c.ink), cell("Exit-multiple value / share", money(dcf.perShareExit), c.ink), cell("Blended (perpetuity + exit)", money(dcf.perShareBlended), c.ink)), dcf.warns && dcf.warns.length > 0 && /*#__PURE__*/React.createElement("ul", {
-    style: {
-      margin: "12px 0 0",
-      padding: 0,
-      listStyle: "none",
-      display: "flex",
-      flexDirection: "column",
-      gap: 5
-    }
-  }, dcf.warns.map((w, i) => /*#__PURE__*/React.createElement("li", {
-    key: i,
-    style: {
-      fontSize: 11.5,
-      color: c.ink,
-      lineHeight: 1.4
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: {
-      color: c.gold,
-      marginRight: 6
-    }
-  }, "\u26A0"), w))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      color: c.mut,
-      marginTop: 10,
-      lineHeight: 1.45
-    }
-  }, "Exit-multiple method values the final-year FCF at your exit multiple instead of a perpetuity; the blend averages the two. Not financial advice \u2014 outputs are only as good as your assumptions below."));
+  const cell = (label, value, color) => React.createElement("div", { style: { display:"flex", flexDirection:"column", gap:2 } },
+    React.createElement("span", { style: { fontSize:9, letterSpacing:".05em", textTransform:"uppercase", color:c.mut } }, label),
+    React.createElement("span", { style: { fontSize:14, fontWeight:600, color:color||c.ink, fontVariantNumeric:"tabular-nums" } }, value));
+  return React.createElement("div", { style: { border:"1px solid "+c.line, borderLeft:"3px solid "+c.gold, background:c.panel2, borderRadius:8, padding:16, marginBottom:18 } },
+    React.createElement("div", { style: { fontSize:10, letterSpacing:".12em", textTransform:"uppercase", color:c.gold, marginBottom:12 } }, "Your DCF · intrinsic value"),
+    React.createElement("div", { style: { display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(120px, 1fr))", gap:"12px 18px" } },
+      cell("Intrinsic / share (perpetuity)", money(dcf.perShare), dcf.valid?c.ink:c.mut),
+      cell("Upside vs price", dcf.valid?pct(dcf.upside):"—", dcf.valid?dcf.upside>=0?c.green:c.red:c.mut),
+      cell("Buy below (margin of safety)", money(dcf.buyBelow), c.blue),
+      cell("Terminal value % of EV", dcf.tvWeight!=null?pct(dcf.tvWeight,0):"—", tvHot?c.red:c.ink),
+      cell("Exit-multiple value / share", money(dcf.perShareExit), c.ink),
+      cell("Blended (perpetuity + exit)", money(dcf.perShareBlended), c.ink)),
+    dcf.warns && dcf.warns.length > 0 && React.createElement("ul", { style: { margin:"12px 0 0", padding:0, listStyle:"none", display:"flex", flexDirection:"column", gap:5 } },
+      dcf.warns.map((w,i) => React.createElement("li", { key:i, style: { fontSize:11.5, color:c.ink, lineHeight:1.4 } },
+        React.createElement("span", { style: { color:c.gold, marginRight:6 } }, "⚠"), w))),
+    React.createElement("div", { style: { fontSize:10, color:c.mut, marginTop:10, lineHeight:1.45 } },
+      "Exit-multiple method values the final-year FCF at your exit multiple instead of a perpetuity; the blend averages the two. Not financial advice — outputs are only as good as your assumptions below."));
 }
-function AnalystCard({
-  analyst,
-  dcf,
-  c,
-  pct,
-  price
-}) {
+
+function AnalystCard({ analyst, dcf, c, pct, price }) {
   if (!analyst) return null;
   const money = x => x == null ? "—" : "$" + Number(x).toFixed(2);
   const rec = analyst.recommendation;
   const pt = analyst.priceTarget;
-  const consColor = !rec ? c.mut : rec.consensus === "Strong Buy" || rec.consensus === "Buy" ? c.green : rec.consensus === "Sell" || rec.consensus === "Strong Sell" ? c.red : rec.consensus === "Hold" ? c.gold : c.mut;
-  const cell = (label, value, color) => /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      flexDirection: "column",
-      gap: 2
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 9,
-      letterSpacing: ".05em",
-      textTransform: "uppercase",
-      color: c.mut
-    }
-  }, label), /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 14,
-      fontWeight: 600,
-      color: color || c.ink,
-      fontVariantNumeric: "tabular-nums"
-    }
-  }, value));
+  const consColor = !rec ? c.mut
+    : rec.consensus === "Strong Buy" || rec.consensus === "Buy" ? c.green
+    : rec.consensus === "Sell" || rec.consensus === "Strong Sell" ? c.red
+    : rec.consensus === "Hold" ? c.gold : c.mut;
+  const cell = (label, value, color) => React.createElement("div", { style: { display:"flex", flexDirection:"column", gap:2 } },
+    React.createElement("span", { style: { fontSize:9, letterSpacing:".05em", textTransform:"uppercase", color:c.mut } }, label),
+    React.createElement("span", { style: { fontSize:14, fontWeight:600, color:color||c.ink, fontVariantNumeric:"tabular-nums" } }, value));
   const mean = pt && pt.mean != null ? Number(pt.mean) : null;
   const median = pt && pt.median != null ? Number(pt.median) : null;
   const dcfVsMean = mean && dcf.valid ? dcf.perShare / mean - 1 : null;
   const priceVsMean = mean && price ? mean / price - 1 : null;
-  return /*#__PURE__*/React.createElement("div", {
-    style: {
-      border: "1px solid " + c.line,
-      borderLeft: "3px solid " + c.gold,
-      background: c.panel2,
-      borderRadius: 8,
-      padding: 16,
-      marginBottom: 18
+  return React.createElement("div", { style: { border:"1px solid "+c.line, borderLeft:"3px solid "+c.gold, background:c.panel2, borderRadius:8, padding:16, marginBottom:18 } },
+    React.createElement("div", { style: { fontSize:10, letterSpacing:".12em", textTransform:"uppercase", color:c.gold, marginBottom:12 } }, "Market · analyst views"),
+    React.createElement("div", { style: { display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(110px, 1fr))", gap:"12px 18px" } },
+      cell("Rating consensus", rec?rec.consensus:"—", consColor),
+      rec && cell("Analysts", String(rec.total), c.ink),
+      rec && cell("Buy / Hold / Sell", (rec.strongBuy+rec.buy)+" / "+rec.hold+" / "+(rec.sell+rec.strongSell), c.ink),
+      cell("Avg target", money(mean), mean?c.ink:c.mut),
+      cell("Median target", money(median), median?c.ink:c.mut),
+      cell("High / Low", pt ? money(pt.high)+" / "+money(pt.low) : "—", pt?c.ink:c.mut)),
+    mean && React.createElement("div", { style: { display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(150px, 1fr))", gap:"10px 18px", marginTop:14, paddingTop:12, borderTop:"1px solid "+c.line } },
+      priceVsMean != null && cell("Price vs avg target", pct(priceVsMean), priceVsMean>=0?c.green:c.red),
+      dcfVsMean != null && cell("Your DCF vs avg target", pct(dcfVsMean), dcfVsMean>=0?c.green:c.red)),
+    analyst.notes && analyst.notes.length > 0 && React.createElement("ul", { style: { margin:"12px 0 0", padding:0, listStyle:"none", display:"flex", flexDirection:"column", gap:4 } },
+      analyst.notes.map((n,i) => React.createElement("li", { key:i, style: { fontSize:11, color:c.mut, lineHeight:1.4 } }, "· ", n))),
+    React.createElement("div", { style: { fontSize:10, color:c.mut, marginTop:10, lineHeight:1.45 } },
+      "Targets and ratings are third-party analyst opinions, not Equity Terminal's view — shown for comparison only."));
+}
+
+// ================================================================
+// EQUITY TERMINAL — QUANT HEDGE FUND ENGINE
+// Three strategies + combined score
+// All computed from price/volume data already in `data` + `ind`
+// ================================================================
+
+// ---- Additional math helpers ----
+function adx(data, n) {
+  // Average Directional Index
+  const len = data.length;
+  const plusDM = [], minusDM = [], tr = [];
+  for (let i = 1; i < len; i++) {
+    const upMove = data[i].high - data[i-1].high;
+    const downMove = data[i-1].low - data[i].low;
+    plusDM.push(upMove > downMove && upMove > 0 ? upMove : 0);
+    minusDM.push(downMove > upMove && downMove > 0 ? downMove : 0);
+    tr.push(Math.max(data[i].high - data[i].low,
+      Math.abs(data[i].high - data[i-1].close),
+      Math.abs(data[i].low - data[i-1].close)));
+  }
+  // Wilder smooth
+  const smooth = (arr, n) => {
+    const out = Array(arr.length).fill(null);
+    let sum = arr.slice(0, n).reduce((a,b)=>a+b,0);
+    out[n-1] = sum;
+    for (let i = n; i < arr.length; i++) {
+      sum = sum - sum/n + arr[i];
+      out[i] = sum;
     }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      letterSpacing: ".12em",
-      textTransform: "uppercase",
-      color: c.gold,
-      marginBottom: 12
+    return out;
+  };
+  const sTR = smooth(tr, n), sPDM = smooth(plusDM, n), sMDM = smooth(minusDM, n);
+  const pDI = sTR.map((v,i) => v ? 100*sPDM[i]/v : null);
+  const mDI = sTR.map((v,i) => v ? 100*sMDM[i]/v : null);
+  const dx = pDI.map((v,i) => v!=null && mDI[i]!=null && (v+mDI[i]) ?
+    100*Math.abs(v-mDI[i])/(v+mDI[i]) : null);
+  // Smooth DX -> ADX
+  const adxArr = Array(dx.length).fill(null);
+  let first = null, firstIdx = -1;
+  for (let i = 0; i < dx.length; i++) {
+    if (dx[i] != null) { if (first==null){first=dx[i];firstIdx=i;} }
+  }
+  if (firstIdx < 0) return { adx: Array(len).fill(null), pdi: [null,...pDI], mdi: [null,...mDI] };
+  // Build adx from firstIdx
+  let adxVal = dx[firstIdx];
+  adxArr[firstIdx] = adxVal;
+  for (let i = firstIdx+1; i < dx.length; i++) {
+    if (dx[i] != null) { adxVal = (adxVal*(n-1) + dx[i])/n; adxArr[i] = adxVal; }
+  }
+  return { adx: [null,...adxArr], pdi: [null,...pDI], mdi: [null,...mDI] };
+}
+
+function donchian(data, n) {
+  return data.map((_, i) => {
+    if (i < n-1) return { upper: null, lower: null, mid: null };
+    const w = data.slice(i-n+1, i+1);
+    const upper = Math.max(...w.map(b=>b.high));
+    const lower = Math.min(...w.map(b=>b.low));
+    return { upper, lower, mid: (upper+lower)/2 };
+  });
+}
+
+function zscore(arr, n) {
+  return arr.map((v, i) => {
+    if (i < n-1 || v == null) return null;
+    const w = arr.slice(i-n+1, i+1).filter(x => x != null);
+    if (w.length < 2) return null;
+    const m = w.reduce((a,b)=>a+b,0)/w.length;
+    const sd = Math.sqrt(w.reduce((a,b)=>a+(b-m)**2,0)/w.length);
+    return sd > 0 ? (v - m)/sd : 0;
+  });
+}
+
+function rollingPctReturn(closes, n) {
+  return closes.map((v, i) => i < n ? null : v/closes[i-n] - 1);
+}
+
+// ================================================================
+// ENGINE 1: FACTOR MODEL
+// Scores: Value (DCF upside), Momentum (price + RSI), Quality (FCF/OBV)
+// ================================================================
+function computeFactorModel(data, ind, dcf) {
+  const n = data.length - 1;
+  const cl = data.map(b => b.close);
+
+  // --- Value Factor (0-100) ---
+  let valueScore = 50; // neutral default
+  const dcfUp = dcf.valid ? dcf.upside * 100 : null; // in %
+  if (dcfUp !== null) {
+    // Map: >50% upside=100, 20%=75, 0%=50, -20%=25, <-50%=0
+    valueScore = Math.max(0, Math.min(100, 50 + dcfUp * 1.0));
+  }
+
+  // --- Momentum Factor (0-100): 12-1 month momentum + RSI trend ---
+  const mom12 = n >= 252 ? cl[n]/cl[n-252] - 1 : n >= 120 ? cl[n]/cl[n-120] - 1 : n >= 60 ? cl[n]/cl[n-60] - 1 : null;
+  const mom1  = n >= 21  ? cl[n]/cl[n-21]  - 1 : null;
+  const adjMom = mom12 !== null && mom1 !== null ? mom12 - mom1 : mom12; // skip last month (standard)
+  const rsiV = ind.rsi[n];
+  let momScore = 50;
+  if (adjMom !== null) momScore = Math.max(0, Math.min(100, 50 + adjMom * 200));
+  if (rsiV != null) momScore = momScore * 0.7 + (rsiV) * 0.3; // RSI blend
+  momScore = Math.max(0, Math.min(100, momScore));
+
+  // --- Quality Factor (0-100): OBV trend + FCF validity + low vol ---
+  const vols = data.map(b => b.volume||0);
+  const avgVol = vols.slice(Math.max(0,n-20),n+1).reduce((a,b)=>a+b,0)/Math.min(20,n+1);
+  const obvTrend = ind.obv[n] > (ind.obv.slice(Math.max(0,n-20),n+1).reduce((a,b)=>a+b,0)/20);
+  const atrV = ind.atr[n];
+  const atrPctV = atrV && cl[n] ? atrV/cl[n]*100 : null;
+  let qualScore = 50;
+  if (obvTrend) qualScore += 20;
+  if (dcf.valid && dcf.proj && dcf.proj.length) qualScore += 15;
+  if (atrPctV !== null) qualScore -= Math.max(0, (atrPctV - 2) * 3); // penalise high vol
+  if (ind.macd.hist[n] > 0) qualScore += 10;
+  qualScore = Math.max(0, Math.min(100, qualScore));
+
+  // Weighted combined factor score
+  const factorScore = Math.round(valueScore * 0.35 + momScore * 0.40 + qualScore * 0.25);
+
+  // Signal label
+  const factorSignal = factorScore >= 75 ? "Strong Long" :
+    factorScore >= 58 ? "Moderate Long" :
+    factorScore >= 42 ? "Neutral" :
+    factorScore >= 25 ? "Moderate Short/Avoid" : "Strong Short/Avoid";
+
+  // Position size (Kelly-lite: score/100 * base, capped at 10%)
+  const rawSize = (factorScore/100) * 0.12;
+  const posSize = Math.max(0, Math.min(0.10, rawSize));
+
+  return {
+    factorScore, factorSignal, posSize,
+    breakdown: { valueScore: Math.round(valueScore), momScore: Math.round(momScore), qualScore: Math.round(qualScore) },
+    details: { dcfUpside: dcfUp, adjMom, rsiV, obvTrend, atrPctV }
+  };
+}
+
+// ================================================================
+// ENGINE 2: STATISTICAL ARBITRAGE / MEAN REVERSION
+// Z-score of price vs rolling mean + RSI z-score + reversion backtest
+// ================================================================
+function computeStatArb(data, ind) {
+  const n = data.length - 1;
+  const cl = data.map(b => b.close);
+  const lookback = Math.min(60, Math.floor(n/2));
+
+  // Price z-score (rolling 20-bar)
+  const priceZ = zscore(cl, 20);
+  const rsiArr = ind.rsi;
+  const rsiZ = zscore(rsiArr.filter(v=>v!=null).length > 20 ? rsiArr : rsiArr, 20);
+
+  const pz = priceZ[n];
+  const rz = rsiZ[n];
+
+  // Bollinger %B position
+  const bb = ind.bb[n];
+  const bbPct = bb && bb.u && bb.l && (bb.u - bb.l) > 0
+    ? (cl[n] - bb.l) / (bb.u - bb.l) : 0.5;
+
+  // Combined reversion score: z-scores + BB position
+  // Oversold (reversion long opportunity) = low scores
+  // Overbought (reversion short/trim) = high scores
+  const reversionScore = pz !== null && rz !== null
+    ? (pz * 0.5 + rz * 0.4 + (bbPct - 0.5) * 2 * 0.1)
+    : pz !== null ? pz : 0;
+
+  // Signal
+  const statArbSignal = reversionScore <= -2.0 ? "Strong Mean-Reversion Long" :
+    reversionScore <= -1.0 ? "Reversion Long Setup" :
+    reversionScore <= -0.5 ? "Mild Oversold" :
+    reversionScore >= 2.0 ? "Strong Mean-Reversion Short/Trim" :
+    reversionScore >= 1.0 ? "Reversion Short/Trim Setup" :
+    reversionScore >= 0.5 ? "Mild Overbought" : "At Fair Value";
+
+  // Backtest: enter when priceZ < -1.5, exit when priceZ > 0 or after 10 bars
+  const entryThresh = -1.5, exitThresh = 0.0, maxHold = 10;
+  const btRets = [];
+  let inPos = false, entryPx = 0, holdBars = 0;
+  for (let i = 20; i <= n; i++) {
+    if (!inPos && priceZ[i] !== null && priceZ[i] < entryThresh) {
+      inPos = true; entryPx = cl[i]; holdBars = 0;
+    } else if (inPos) {
+      holdBars++;
+      if ((priceZ[i] !== null && priceZ[i] > exitThresh) || holdBars >= maxHold) {
+        btRets.push(cl[i]/entryPx - 1);
+        inPos = false;
+      }
     }
-  }, "Market \xB7 analyst views"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))",
-      gap: "12px 18px"
+  }
+  if (inPos) btRets.push(cl[n]/entryPx - 1);
+  const wins = btRets.filter(r=>r>0).length;
+  const avgRet = btRets.length ? btRets.reduce((a,b)=>a+b,0)/btRets.length : null;
+
+  // Position size: larger when more stretched
+  const absPz = pz !== null ? Math.abs(pz) : 0;
+  const posSize = reversionScore < -1.0 ? Math.min(0.08, absPz * 0.03) : 0;
+
+  return {
+    reversionScore: +reversionScore.toFixed(3),
+    statArbSignal, posSize,
+    priceZ: pz !== null ? +pz.toFixed(2) : null,
+    rsiZ: rz !== null ? +rz.toFixed(2) : null,
+    bbPct: +bbPct.toFixed(3),
+    backtest: { trades: btRets.length, winRate: btRets.length ? wins/btRets.length : null, avgRet }
+  };
+}
+
+// ================================================================
+// ENGINE 3: CTA TREND FOLLOWING
+// ADX strength + Donchian breakouts + EMA stack + ATR momentum
+// ================================================================
+function computeCTA(data, ind) {
+  const n = data.length - 1;
+  const cl = data.map(b => b.close);
+
+  const adxResult = adx(data, 14);
+  const adxVal = adxResult.adx[n];
+  const pdiVal = adxResult.pdi[n];
+  const mdiVal = adxResult.mdi[n];
+
+  const don20 = donchian(data, 20);
+  const don55 = donchian(data, Math.min(55, data.length-1));
+  const d20 = don20[n], d55 = don55[n];
+
+  // Breakout signals
+  const above20Upper = d20 && d20.upper && cl[n] >= d20.upper * 0.998;
+  const below20Lower = d20 && d20.lower && cl[n] <= d20.lower * 1.002;
+  const above55Upper = d55 && d55.upper && cl[n] >= d55.upper * 0.998;
+
+  // EMA stack: price > EMA50 > EMA200
+  const e200 = ema(cl, 200);
+  const ema50V = ind.ema50[n], ema200V = e200[n];
+  const stackBull = ema50V && ema200V && cl[n] > ema50V && ema50V > ema200V;
+  const stackBear = ema50V && ema200V && cl[n] < ema50V && ema50V < ema200V;
+
+  // ATR-normalized momentum (close change / ATR)
+  const atrV = ind.atr[n];
+  const prevCl = n > 0 ? cl[n-1] : cl[n];
+  const atrMom = atrV && atrV > 0 ? (cl[n] - prevCl)/atrV : 0;
+
+  // CTA score 0-100
+  let ctaScore = 50;
+  if (adxVal != null) {
+    if (adxVal > 25) ctaScore += 15;  // trending market
+    if (adxVal > 40) ctaScore += 10;  // strong trend
+  }
+  if (pdiVal != null && mdiVal != null) {
+    if (pdiVal > mdiVal) ctaScore += 10; // bullish DI
+    else ctaScore -= 10;
+  }
+  if (above55Upper) ctaScore += 15;
+  else if (above20Upper) ctaScore += 8;
+  if (below20Lower) ctaScore -= 15;
+  if (stackBull) ctaScore += 10;
+  if (stackBear) ctaScore -= 10;
+  ctaScore += atrMom * 5;
+  ctaScore = Math.max(0, Math.min(100, ctaScore));
+
+  const ctaSignal = ctaScore >= 78 ? "Strong Trend Long" :
+    ctaScore >= 62 ? "Trend Long" :
+    ctaScore >= 42 ? "No Clear Trend" :
+    ctaScore >= 25 ? "Trend Short/Avoid" : "Strong Trend Short/Avoid";
+
+  // Backtest: enter on 20-bar Donchian break, exit on 10-bar lower band
+  const btRets = [], don10 = donchian(data, 10);
+  let inPos = false, entryPx = 0;
+  for (let i = 20; i <= n; i++) {
+    const d = don20[i], d10 = don10[i];
+    if (!inPos && d && d.upper && cl[i] >= d.upper * 0.998 &&
+        adxResult.adx[i] != null && adxResult.adx[i] > 20) {
+      inPos = true; entryPx = cl[i];
+    } else if (inPos && d10 && d10.lower && cl[i] <= d10.lower) {
+      btRets.push(cl[i]/entryPx - 1);
+      inPos = false;
     }
-  }, cell("Rating consensus", rec ? rec.consensus : "—", consColor), rec && cell("Analysts", String(rec.total), c.ink), rec && cell("Buy / Hold / Sell", rec.strongBuy + rec.buy + " / " + rec.hold + " / " + (rec.sell + rec.strongSell), c.ink), cell("Avg target", money(mean), mean ? c.ink : c.mut), cell("Median target", money(median), median ? c.ink : c.mut), cell("High / Low", pt ? money(pt.high) + " / " + money(pt.low) : "—", pt ? c.ink : c.mut)), mean && /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
-      gap: "10px 18px",
-      marginTop: 14,
-      paddingTop: 12,
-      borderTop: "1px solid " + c.line
+  }
+  if (inPos) btRets.push(cl[n]/entryPx - 1);
+  const wins = btRets.filter(r=>r>0).length;
+  const avgRet = btRets.length ? btRets.reduce((a,b)=>a+b,0)/btRets.length : null;
+  const grossWin = btRets.filter(r=>r>0).reduce((a,b)=>a+b,0);
+  const grossLoss = Math.abs(btRets.filter(r=>r<=0).reduce((a,b)=>a+b,0));
+  const pf = grossLoss > 0 ? grossWin/grossLoss : grossWin > 0 ? Infinity : null;
+
+  // Position sizing: ATR-based (risk 1% of portfolio per trade)
+  const posSize = atrV && cl[n] ? Math.min(0.10, 0.01 / (atrV/cl[n])) : 0.02;
+
+  return {
+    ctaScore: Math.round(ctaScore), ctaSignal, posSize,
+    adxVal: adxVal ? +adxVal.toFixed(1) : null,
+    pdiVal: pdiVal ? +pdiVal.toFixed(1) : null,
+    mdiVal: mdiVal ? +mdiVal.toFixed(1) : null,
+    above20Upper, above55Upper, below20Lower, stackBull, stackBear,
+    backtest: {
+      trades: btRets.length,
+      winRate: btRets.length ? wins/btRets.length : null,
+      avgRet,
+      profitFactor: pf
     }
-  }, priceVsMean != null && cell("Price vs avg target", pct(priceVsMean), priceVsMean >= 0 ? c.green : c.red), dcfVsMean != null && cell("Your DCF vs avg target", pct(dcfVsMean), dcfVsMean >= 0 ? c.green : c.red)), analyst.notes && analyst.notes.length > 0 && /*#__PURE__*/React.createElement("ul", {
-    style: {
-      margin: "12px 0 0",
-      padding: 0,
-      listStyle: "none",
-      display: "flex",
-      flexDirection: "column",
-      gap: 4
+  };
+}
+
+// ================================================================
+// COMBINED QUANT SCORE + EQUITY CURVES
+// ================================================================
+function computeQuantEngine(data, ind, dcf) {
+  if (!data || data.length < 30) return null;
+  const factor = computeFactorModel(data, ind, dcf);
+  const statArb = computeStatArb(data, ind);
+  const cta = computeCTA(data, ind);
+
+  // Combined score: factor 40%, CTA 40%, statArb (inverted to long-bias) 20%
+  // StatArb: score < 0 means oversold = bullish => remap to 0-100
+  const statArbLong = Math.max(0, Math.min(100, 50 - statArb.reversionScore * 20));
+  const combined = Math.round(factor.factorScore * 0.40 + cta.ctaScore * 0.40 + statArbLong * 0.20);
+
+  const combinedSignal = combined >= 78 ? "Strong Long" :
+    combined >= 62 ? "Long Bias" :
+    combined >= 42 ? "Neutral / Watch" :
+    combined >= 25 ? "Short Bias / Avoid" : "Strong Avoid";
+
+  // Best position size = average of strategies that agree
+  const longStrategies = [];
+  if (factor.factorScore >= 60) longStrategies.push(factor.posSize);
+  if (cta.ctaScore >= 60) longStrategies.push(cta.posSize);
+  if (statArb.reversionScore <= -1.0) longStrategies.push(statArb.posSize);
+  const suggestedSize = longStrategies.length
+    ? +(longStrategies.reduce((a,b)=>a+b,0)/longStrategies.length * 100).toFixed(1)
+    : 0;
+
+  // Build factor equity curve (momentum-quality long-only backtest)
+  // Entry: factorScore proxy > 60 (using ema20>ema50 + rsi>50 + obv trend as live proxy)
+  const cl = data.map(b => b.close);
+  const n = data.length - 1;
+  const e50 = ind.ema50, sma20 = ind.sma20, rsiArr = ind.rsi, obvArr = ind.obv;
+  const factorCurve = [];
+  const bhCurve = [];
+  let fEq = 1, bhEq = 1, fPos = false, fEntry = 0;
+  const base = cl[0];
+  for (let i = 1; i <= n; i++) {
+    const longOk = sma20[i] != null && e50[i] != null && rsiArr[i] != null &&
+      sma20[i] > e50[i] && rsiArr[i] > 50 &&
+      (obvArr[i] == null || i < 5 || obvArr[i] > obvArr.slice(Math.max(0,i-5),i).reduce((a,b)=>a+b,0)/5);
+    if (!fPos && longOk) { fPos = true; fEntry = cl[i]; }
+    else if (fPos && !longOk) { fEq *= (cl[i]/fEntry) * 0.998; fPos = false; }
+    if (fPos) factorCurve.push({ date: data[i].date, v: +(fEq * cl[i]/fEntry).toFixed(4) });
+    else factorCurve.push({ date: data[i].date, v: +fEq.toFixed(4) });
+    bhCurve.push({ date: data[i].date, v: +(cl[i]/base).toFixed(4) });
+  }
+  if (fPos) fEq *= (cl[n]/fEntry) * 0.998;
+
+  // Factor backtest stats
+  const fRets = [], fInPos2 = { on: false, e: 0 };
+  for (let i = 1; i <= n; i++) {
+    const longOk = sma20[i] != null && e50[i] != null && rsiArr[i] != null &&
+      sma20[i] > e50[i] && rsiArr[i] > 50;
+    if (!fInPos2.on && longOk) { fInPos2.on = true; fInPos2.e = cl[i]; }
+    else if (fInPos2.on && !longOk) { fRets.push(cl[i]/fInPos2.e - 1); fInPos2.on = false; }
+  }
+  if (fInPos2.on) fRets.push(cl[n]/fInPos2.e - 1);
+  const fWins = fRets.filter(r=>r>0);
+  const fLosses = fRets.filter(r=>r<=0);
+  const fGW = fWins.reduce((a,b)=>a+b,0);
+  const fGL = Math.abs(fLosses.reduce((a,b)=>a+b,0));
+
+  // Max DD on factor curve
+  let pk = 1, maxDD = 0;
+  for (const pt of factorCurve) { if (pt.v > pk) pk = pt.v; const dd = pt.v/pk-1; if (dd < maxDD) maxDD = dd; }
+
+  // Sharpe on factor returns
+  let sharpe = null;
+  if (fRets.length > 1) {
+    const m = fRets.reduce((a,b)=>a+b,0)/fRets.length;
+    const sd = Math.sqrt(fRets.map(r=>(r-m)**2).reduce((a,b)=>a+b,0)/(fRets.length-1));
+    sharpe = sd > 0 ? +(m/sd).toFixed(2) : null;
+  }
+
+  return {
+    combined, combinedSignal, suggestedSize,
+    factor, statArb, cta,
+    factorBt: {
+      stratRet: +(fEq - 1).toFixed(4),
+      bh: +(cl[n]/cl[0] - 1).toFixed(4),
+      trades: fRets.length,
+      winRate: fRets.length ? fWins.length/fRets.length : null,
+      profitFactor: fGL > 0 ? +(fGW/fGL).toFixed(2) : null,
+      maxDD: +maxDD.toFixed(4),
+      sharpe
+    },
+    factorCurve,
+    bhCurve
+  };
+}
+
+// ================================================================
+// REACT COMPONENT: QuantTab
+// ================================================================
+function QuantTab({ data, ind, dcf, c, pct, fmt }) {
+  const quant = React.useMemo(() => computeQuantEngine(data, ind, dcf), [data, ind, dcf]);
+
+  if (!quant) return React.createElement("div", { style: { color: c.mut, padding: 20 } },
+    "Need at least 30 bars to run the quant engine. Fetch a ticker first.");
+
+  const { combined, combinedSignal, suggestedSize, factor, statArb, cta, factorBt, factorCurve, bhCurve } = quant;
+
+  const accentCombined = combined >= 62 ? c.green : combined >= 42 ? c.gold : c.red;
+
+  const scoreBar = (val, max, color) => React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
+    React.createElement("div", { style: { flex: 1, height: 6, background: c.line, borderRadius: 999, overflow: "hidden" } },
+      React.createElement("div", { style: { width: (val/max*100)+"%" , height: "100%", background: color, borderRadius: 999 } })),
+    React.createElement("span", { style: { fontFamily: "'IBM Plex Mono',monospace", fontSize: 12, color, minWidth: 30 } }, val));
+
+  const cell = (label, value, color) => React.createElement("div", { style: { display:"flex", flexDirection:"column", gap:2 } },
+    React.createElement("span", { style: { fontSize:9, letterSpacing:".05em", textTransform:"uppercase", color:c.mut } }, label),
+    React.createElement("span", { style: { fontSize:13, fontWeight:600, color:color||c.ink, fontVariantNumeric:"tabular-nums" } }, value));
+
+  const sectionHead = (title, sub) => React.createElement("div", { style: { marginBottom: 12 } },
+    React.createElement("div", { style: { fontFamily: "'Fraunces',Georgia,serif", fontSize: 16, color: c.gold } }, title),
+    sub && React.createElement("div", { style: { fontSize: 11, color: c.mut, marginTop: 2 } }, sub));
+
+  const card = (children, accent) => React.createElement("div", {
+    style: { border: "1px solid "+c.line, borderLeft: "3px solid "+(accent||c.gold), background: c.panel2, borderRadius: 8, padding: 16, marginBottom: 16 }
+  }, children);
+
+  // Chart: factor strategy vs buy-and-hold
+  const chartData = factorCurve.map((pt, i) => ({
+    date: pt.date, strategy: pt.v, bh: quant.bhCurve[i] ? quant.bhCurve[i].v : null
+  }));
+
+  // ---- Equity Curve Chart ----
+  const EquityCurveChart = () => React.createElement(Recharts.ResponsiveContainer, { width: "100%", height: 200 },
+    React.createElement(Recharts.LineChart, { data: chartData, margin: { top: 4, right: 60, left: 0, bottom: 0 } },
+      React.createElement(Recharts.CartesianGrid, { stroke: c.line, strokeDasharray: "2 4", vertical: false }),
+      React.createElement(Recharts.XAxis, { dataKey: "date", tick: { fill: c.mut, fontSize: 9 }, minTickGap: 40, stroke: c.line }),
+      React.createElement(Recharts.YAxis, { orientation: "right", tick: { fill: c.mut, fontSize: 9, fontFamily: "monospace" }, stroke: c.line, width: 48,
+        tickFormatter: v => (v*100-100).toFixed(0)+"%" }),
+      React.createElement(Recharts.Tooltip, { contentStyle: { background: c.panel2, border: "1px solid "+c.line, borderRadius: 6, fontSize: 11 },
+        formatter: (v, n) => [((v-1)*100).toFixed(2)+"%", n === "strategy" ? "Factor Strategy" : "Buy & Hold"] }),
+      React.createElement(Recharts.ReferenceLine, { y: 1, stroke: c.mut, strokeDasharray: "3 3" }),
+      React.createElement(Recharts.Line, { dataKey: "bh", stroke: c.mut, dot: false, strokeWidth: 1.5, strokeDasharray: "4 3" }),
+      React.createElement(Recharts.Line, { dataKey: "strategy", stroke: c.gold, dot: false, strokeWidth: 2 })));
+
+  // ---- Z-score mini bar ----
+  const zBar = (z) => {
+    if (z == null) return React.createElement("span", { style: { color: c.mut } }, "—");
+    const color = z <= -1.5 ? c.green : z >= 1.5 ? c.red : z <= -0.5 ? c.green+"99" : z >= 0.5 ? c.red+"99" : c.gold;
+    const label = z <= -2 ? "Extreme Oversold" : z <= -1 ? "Oversold" : z >= 2 ? "Extreme Overbought" : z >= 1 ? "Overbought" : "Normal";
+    return React.createElement("span", { style: { color, fontWeight: 600, fontFamily: "monospace", fontSize: 13 } },
+      z.toFixed(2), " ", React.createElement("span", { style: { fontSize: 10, fontWeight: 400 } }, "(", label, ")"));
+  };
+
+  return React.createElement("div", null,
+
+    // ---- COMBINED SCORE ----
+    React.createElement("div", {
+      style: { border: "1px solid "+c.line, borderLeft: "4px solid "+accentCombined, background: c.panel2, borderRadius: 8, padding: 18, marginBottom: 20 }
+    },
+      React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "baseline", flexWrap: "wrap", gap: 8 } },
+        React.createElement("div", null,
+          React.createElement("div", { style: { fontSize: 10, letterSpacing: ".14em", textTransform: "uppercase", color: c.gold } }, "Combined Quant Score"),
+          React.createElement("div", { style: { fontSize: 22, fontWeight: 700, color: accentCombined, marginTop: 4 } }, combinedSignal)),
+        React.createElement("div", { style: { textAlign: "right" } },
+          React.createElement("div", { style: { fontSize: 40, fontWeight: 700, color: accentCombined, fontFamily: "monospace", lineHeight: 1 } }, combined),
+          React.createElement("div", { style: { fontSize: 11, color: c.mut, marginTop: 2 } }, "out of 100"))),
+      React.createElement("div", { style: { marginTop: 14 } },
+        React.createElement("div", { style: { height: 8, borderRadius: 999, background: c.line, overflow: "hidden" } },
+          React.createElement("div", { style: { width: combined+"%", height: "100%", background: accentCombined, borderRadius: 999, transition: "width .4s" } })),
+        React.createElement("div", { style: { display: "flex", justifyContent: "space-between", marginTop: 3 } },
+          React.createElement("span", { style: { fontSize: 9, color: c.mut } }, "Avoid"),
+          React.createElement("span", { style: { fontSize: 9, color: c.mut } }, "Neutral"),
+          React.createElement("span", { style: { fontSize: 9, color: c.mut } }, "Strong Long"))),
+      React.createElement("div", { style: { display: "flex", gap: 20, flexWrap: "wrap", marginTop: 14 } },
+        cell("Factor", factor.factorScore+"/100", factor.factorScore>=60?c.green:factor.factorScore>=40?c.gold:c.red),
+        cell("CTA Trend", cta.ctaScore+"/100", cta.ctaScore>=60?c.green:cta.ctaScore>=40?c.gold:c.red),
+        cell("Mean-Reversion Z", statArb.priceZ !== null ? statArb.priceZ.toFixed(2) : "—", statArb.priceZ!==null&&statArb.priceZ<=-1?c.green:statArb.priceZ!==null&&statArb.priceZ>=1?c.red:c.gold),
+        cell("Suggested size", suggestedSize > 0 ? suggestedSize+"% of portfolio" : "0% (no signal)", suggestedSize>0?c.green:c.mut)),
+      React.createElement("div", { style: { fontSize: 10, color: c.mut, marginTop: 10, lineHeight: 1.5 } },
+        "Factor (40%) × CTA (40%) × Mean-Reversion (20%). Position sizing = ATR-normalized risk 1% per trade, capped at 10%. All in-sample on current ticker — not a promise of future returns. Not financial advice.")),
+
+    // ---- FACTOR MODEL ----
+    card(React.createElement("div", null,
+      sectionHead("Engine 1 — Factor Model", "Value · Momentum · Quality scoring"),
+      React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 14 } },
+        React.createElement("span", { style: { fontSize: 16, fontWeight: 700, color: factor.factorScore>=60?c.green:factor.factorScore>=40?c.gold:c.red } }, factor.factorSignal),
+        React.createElement("span", { style: { fontSize: 12, color: c.mut, fontFamily: "monospace" } }, factor.factorScore+"/100")),
+      React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8, marginBottom: 14 } },
+        React.createElement("div", null,
+          React.createElement("div", { style: { fontSize: 10, color: c.mut, marginBottom: 3 } }, "VALUE (35%) — DCF upside proxy"),
+          scoreBar(factor.breakdown.valueScore, 100, c.blue)),
+        React.createElement("div", null,
+          React.createElement("div", { style: { fontSize: 10, color: c.mut, marginBottom: 3 } }, "MOMENTUM (40%) — 12-1 month + RSI"),
+          scoreBar(factor.breakdown.momScore, 100, c.gold)),
+        React.createElement("div", null,
+          React.createElement("div", { style: { fontSize: 10, color: c.mut, marginBottom: 3 } }, "QUALITY (25%) — OBV accumulation + FCF + low vol"),
+          scoreBar(factor.breakdown.qualScore, 100, c.violet))),
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(130px,1fr))", gap: "8px 16px" } },
+        cell("DCF upside", factor.details.dcfUpside !== null ? factor.details.dcfUpside.toFixed(1)+"%" : "—", factor.details.dcfUpside>0?c.green:c.red),
+        cell("12-1m momentum", factor.details.adjMom !== null ? pct(factor.details.adjMom) : "—", factor.details.adjMom>0?c.green:c.red),
+        cell("RSI", factor.details.rsiV !== null ? factor.details.rsiV.toFixed(0) : "—", c.ink),
+        cell("OBV trend", factor.details.obvTrend ? "Accumulating ↑" : "Distributing ↓", factor.details.obvTrend?c.green:c.red),
+        cell("ATR %", factor.details.atrPctV !== null ? factor.details.atrPctV.toFixed(1)+"%" : "—", c.ink),
+        cell("Position size", (factor.posSize*100).toFixed(1)+"%", c.ink))),
+    c.green),
+
+    // ---- STAT ARB / MEAN REVERSION ----
+    card(React.createElement("div", null,
+      sectionHead("Engine 2 — Statistical Arbitrage / Mean Reversion", "Z-score price deviation + RSI z-score + Bollinger %B"),
+      React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 14 } },
+        React.createElement("span", { style: { fontSize: 16, fontWeight: 700,
+          color: statArb.reversionScore <= -1?c.green: statArb.reversionScore>=1?c.red:c.gold } }, statArb.statArbSignal)),
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(160px,1fr))", gap: "10px 16px", marginBottom: 14 } },
+        React.createElement("div", null,
+          React.createElement("div", { style: { fontSize: 10, color: c.mut, marginBottom: 4 } }, "Price Z-score (20-bar)"),
+          zBar(statArb.priceZ)),
+        React.createElement("div", null,
+          React.createElement("div", { style: { fontSize: 10, color: c.mut, marginBottom: 4 } }, "RSI Z-score (20-bar)"),
+          zBar(statArb.rsiZ)),
+        React.createElement("div", null,
+          React.createElement("div", { style: { fontSize: 10, color: c.mut, marginBottom: 4 } }, "Bollinger %B"),
+          React.createElement("span", { style: { fontFamily: "monospace", fontSize: 13, color: statArb.bbPct < 0.2 ? c.green : statArb.bbPct > 0.8 ? c.red : c.gold, fontWeight: 600 } },
+            (statArb.bbPct*100).toFixed(0)+"%",
+            React.createElement("span", { style: { fontSize: 10, fontWeight: 400, color: c.mut } }, " (0=lower band, 100=upper band)")))),
+      React.createElement("div", { style: { padding: "10px 12px", background: c.panel, border: "1px solid "+c.line, borderRadius: 6, marginBottom: 12 } },
+        React.createElement("div", { style: { fontSize: 10, color: c.gold, textTransform: "uppercase", letterSpacing: ".08em", marginBottom: 6 } }, "Mean-reversion backtest (entry: z<-1.5, exit: z>0 or 10 bars)"),
+        React.createElement("div", { style: { display: "flex", gap: 20, flexWrap: "wrap" } },
+          cell("Trades", String(statArb.backtest.trades), c.ink),
+          cell("Win rate", statArb.backtest.winRate !== null ? pct(statArb.backtest.winRate, 0) : "—", c.ink),
+          cell("Avg return/trade", statArb.backtest.avgRet !== null ? pct(statArb.backtest.avgRet) : "—", statArb.backtest.avgRet>0?c.green:c.red),
+          cell("Position size", statArb.reversionScore<=-1 ? (statArb.posSize*100).toFixed(1)+"%" : "0% (not triggered)", c.ink))),
+      React.createElement("div", { style: { fontSize: 10, color: c.mut, lineHeight: 1.45 } },
+        "Stat-arb logic: when the price z-score is extremely negative (stretched below its 20-bar mean by >1.5σ), expect mean reversion. Exit when price returns to its mean or after 10 bars. Real stat-arb funds pair two correlated instruments — this single-instrument version is a simplified proxy.")),
+    c.blue),
+
+    // ---- CTA TREND FOLLOWING ----
+    card(React.createElement("div", null,
+      sectionHead("Engine 3 — CTA Trend Following", "ADX strength · Donchian breakouts · EMA stack · ATR sizing"),
+      React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 14 } },
+        React.createElement("span", { style: { fontSize: 16, fontWeight: 700, color: cta.ctaScore>=62?c.green:cta.ctaScore>=42?c.gold:c.red } }, cta.ctaSignal),
+        React.createElement("span", { style: { fontFamily: "monospace", fontSize: 12, color: c.mut } }, cta.ctaScore+"/100")),
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(130px,1fr))", gap: "8px 16px", marginBottom: 14 } },
+        cell("ADX", cta.adxVal !== null ? cta.adxVal.toFixed(1) : "—",
+          cta.adxVal>40?c.green:cta.adxVal>25?c.gold:c.mut),
+        cell("+DI / -DI", cta.pdiVal!==null&&cta.mdiVal!==null ? cta.pdiVal.toFixed(1)+" / "+cta.mdiVal.toFixed(1) : "—",
+          cta.pdiVal>cta.mdiVal?c.green:c.red),
+        cell("20-bar Donchian break", cta.above20Upper ? "✓ Upper" : cta.below20Lower ? "✓ Lower" : "—",
+          cta.above20Upper?c.green:cta.below20Lower?c.red:c.mut),
+        cell("55-bar Donchian break", cta.above55Upper ? "✓ Upper (strong)" : "—",
+          cta.above55Upper?c.green:c.mut),
+        cell("EMA stack", cta.stackBull ? "Bullish ↑" : cta.stackBear ? "Bearish ↓" : "Mixed",
+          cta.stackBull?c.green:cta.stackBear?c.red:c.gold),
+        cell("ATR position size", (cta.posSize*100).toFixed(1)+"%", c.ink)),
+      React.createElement("div", { style: { padding: "10px 12px", background: c.panel, border: "1px solid "+c.line, borderRadius: 6, marginBottom: 12 } },
+        React.createElement("div", { style: { fontSize: 10, color: c.gold, textTransform: "uppercase", letterSpacing: ".08em", marginBottom: 6 } }, "CTA backtest (Donchian 20-bar breakout + ADX>20 filter, exit: 10-bar lower band)"),
+        React.createElement("div", { style: { display: "flex", gap: 20, flexWrap: "wrap" } },
+          cell("Trades", String(cta.backtest.trades), c.ink),
+          cell("Win rate", cta.backtest.winRate !== null ? pct(cta.backtest.winRate, 0) : "—", c.ink),
+          cell("Avg return/trade", cta.backtest.avgRet !== null ? pct(cta.backtest.avgRet) : "—", cta.backtest.avgRet>0?c.green:c.red),
+          cell("Profit factor", cta.backtest.profitFactor !== null ? (cta.backtest.profitFactor===Infinity?"∞":cta.backtest.profitFactor.toFixed(2)) : "—",
+            cta.backtest.profitFactor>=1?c.green:c.red))),
+      React.createElement("div", { style: { fontSize: 10, color: c.mut, lineHeight: 1.45 } },
+        "CTA (Commodity Trading Advisor) funds use systematic trend-following: enter when price breaks multi-week highs with rising ADX trend strength, exit when price breaks back below shorter-term lows. Position size = risk 1% of NAV per trade / (ATR as % of price).")),
+    c.violet),
+
+    // ---- FACTOR EQUITY CURVE ----
+    card(React.createElement("div", null,
+      sectionHead("Factor Strategy Equity Curve", "Factor long-only in-sample — strategy vs buy & hold"),
+      React.createElement("div", { style: { display: "flex", gap: 4, marginBottom: 12, fontSize: 12, fontFamily: "monospace", flexWrap: "wrap" } },
+        React.createElement("span", { style: { color: c.gold } }, "━ Strategy"),
+        React.createElement("span", { style: { color: c.mut, marginLeft: 12 } }, "╌ Buy & Hold")),
+      React.createElement(EquityCurveChart, null),
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(100px,1fr))", gap: "10px 16px", marginTop: 14 } },
+        cell("Strategy return", pct(factorBt.stratRet), factorBt.stratRet>=0?c.green:c.red),
+        cell("Buy & hold", pct(factorBt.bh), factorBt.bh>=0?c.green:c.red),
+        cell("Edge vs B&H", pct(factorBt.stratRet - factorBt.bh), factorBt.stratRet>=factorBt.bh?c.green:c.red),
+        cell("Max drawdown", pct(factorBt.maxDD), c.red),
+        cell("Win rate", factorBt.winRate!==null?pct(factorBt.winRate,0):"—", c.ink),
+        cell("Profit factor", factorBt.profitFactor!==null?factorBt.profitFactor.toFixed(2):"—", factorBt.profitFactor>=1?c.green:c.red),
+        cell("Sharpe (per-trade)", factorBt.sharpe!==null?factorBt.sharpe.toFixed(2):"—", c.ink),
+        cell("Trades", String(factorBt.trades), c.ink)),
+      React.createElement("div", { style: { fontSize: 10, color: c.mut, marginTop: 10, lineHeight: 1.45 } },
+        "Entry: SMA20 > EMA50 AND RSI > 50 AND OBV trend positive. Exit: any condition breaks. Close-to-close fills, 0.2% round-trip cost. ",
+        React.createElement("b", null, "In-sample — does not predict future performance."))),
+    c.gold)
+  );
+}
+
+// ================================================================
+// EQUITY TERMINAL — STRATEGY VALIDATOR
+// Walk-forward · Monte Carlo · Parameter sweep · Regime analysis
+// ================================================================
+
+// Run a single backtest pass on a slice of data with given params
+function runStrategyPass(data, ind, params) {
+  const { zsEntry, zsExit, donPeriod, adxMin, maxHold, feePerSide } = params;
+  const cl = data.map(b => b.close);
+  const n = data.length - 1;
+  if (n < donPeriod + 10) return null;
+
+  // Precompute z-scores for stat-arb
+  const priceZ = zscore(cl, 20);
+
+  // Precompute Donchian for CTA
+  const don = donchian(data, donPeriod);
+  const don10 = donchian(data, 10);
+
+  // Precompute ADX
+  const adxResult = adx(data, 14);
+
+  // Factor proxy: SMA20 > EMA50 AND RSI > 50
+  const sma20 = ind.sma20, ema50 = ind.ema50, rsiArr = ind.rsi;
+
+  // Run all three strategies and collect trades
+  const allTrades = [];
+
+  // --- Stat Arb pass ---
+  let saPos = false, saEntry = 0, saBars = 0;
+  for (let i = 20; i <= n; i++) {
+    if (!saPos && priceZ[i] !== null && priceZ[i] < zsEntry) {
+      saPos = true; saEntry = cl[i]; saBars = 0;
+    } else if (saPos) {
+      saBars++;
+      if ((priceZ[i] !== null && priceZ[i] > zsExit) || saBars >= maxHold) {
+        const ret = cl[i] / saEntry * (1 - feePerSide) * (1 - feePerSide) - 1;
+        allTrades.push({ ret, type: 'statarb', bar: i });
+        saPos = false;
+      }
     }
-  }, analyst.notes.map((n, i) => /*#__PURE__*/React.createElement("li", {
-    key: i,
-    style: {
-      fontSize: 11,
-      color: c.mut,
-      lineHeight: 1.4
+  }
+  if (saPos) allTrades.push({ ret: cl[n] / saEntry * (1-feePerSide)*(1-feePerSide) - 1, type: 'statarb', bar: n });
+
+  // --- CTA pass ---
+  let ctaPos = false, ctaEntry = 0;
+  for (let i = donPeriod; i <= n; i++) {
+    const d = don[i], d10 = don10[i];
+    if (!ctaPos && d && d.upper && cl[i] >= d.upper * 0.999 &&
+        adxResult.adx[i] != null && adxResult.adx[i] > adxMin) {
+      ctaPos = true; ctaEntry = cl[i];
+    } else if (ctaPos && d10 && d10.lower && cl[i] <= d10.lower) {
+      const ret = cl[i] / ctaEntry * (1-feePerSide)*(1-feePerSide) - 1;
+      allTrades.push({ ret, type: 'cta', bar: i });
+      ctaPos = false;
     }
-  }, "\xB7 ", n))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 10,
-      color: c.mut,
-      marginTop: 10,
-      lineHeight: 1.45
+  }
+  if (ctaPos) allTrades.push({ ret: cl[n] / ctaEntry * (1-feePerSide)*(1-feePerSide) - 1, type: 'cta', bar: n });
+
+  // --- Factor pass ---
+  let fPos = false, fEntry = 0;
+  for (let i = 1; i <= n; i++) {
+    const longOk = sma20[i] != null && ema50[i] != null && rsiArr[i] != null &&
+      sma20[i] > ema50[i] && rsiArr[i] > 50;
+    if (!fPos && longOk) { fPos = true; fEntry = cl[i]; }
+    else if (fPos && !longOk) {
+      const ret = cl[i] / fEntry * (1-feePerSide)*(1-feePerSide) - 1;
+      allTrades.push({ ret, type: 'factor', bar: i });
+      fPos = false;
     }
-  }, "Targets and ratings are third-party analyst opinions, not Equity Terminal's view \u2014 shown for comparison only."));
+  }
+  if (fPos) allTrades.push({ ret: cl[n] / fEntry * (1-feePerSide)*(1-feePerSide) - 1, type: 'factor', bar: n });
+
+  if (!allTrades.length) return null;
+
+  const rets = allTrades.map(t => t.ret);
+  const wins = rets.filter(r => r > 0);
+  const losses = rets.filter(r => r <= 0);
+  const gw = wins.reduce((a,b) => a+b, 0);
+  const gl = Math.abs(losses.reduce((a,b) => a+b, 0));
+  const mean = rets.reduce((a,b) => a+b, 0) / rets.length;
+  const sd = rets.length > 1
+    ? Math.sqrt(rets.map(r => (r-mean)**2).reduce((a,b)=>a+b,0) / (rets.length-1))
+    : 0;
+
+  // Equity curve for max DD
+  let eq = 1, pk = 1, maxDD = 0;
+  for (const r of rets) {
+    eq *= (1 + r);
+    if (eq > pk) pk = eq;
+    const dd = eq/pk - 1;
+    if (dd < maxDD) maxDD = dd;
+  }
+
+  return {
+    trades: rets.length,
+    winRate: wins.length / rets.length,
+    expectancy: mean,
+    profitFactor: gl > 0 ? gw / gl : (gw > 0 ? Infinity : 0),
+    sharpe: sd > 0 ? mean / sd : 0,
+    maxDD,
+    totalRet: eq - 1,
+    byStype: {
+      statarb: allTrades.filter(t=>t.type==='statarb').length,
+      cta: allTrades.filter(t=>t.type==='cta').length,
+      factor: allTrades.filter(t=>t.type==='factor').length,
+    }
+  };
+}
+
+// ================================================================
+// WALK-FORWARD VALIDATION
+// Split into nFolds, walk through each fold
+// ================================================================
+function walkForward(data, ind, params, nFolds) {
+  const n = data.length;
+  const foldSize = Math.floor(n / (nFolds + 1));
+  if (foldSize < 30) return null;
+
+  const folds = [];
+  for (let f = 0; f < nFolds; f++) {
+    const trainEnd = foldSize * (f + 1);
+    const testStart = trainEnd;
+    const testEnd = Math.min(n, testStart + foldSize);
+    if (testEnd - testStart < 20) continue;
+
+    const trainData = data.slice(0, trainEnd);
+    const testData = data.slice(testStart, testEnd);
+
+    // Rebuild ind slices for test window
+    const testInd = {
+      sma20: ind.sma20.slice(testStart, testEnd),
+      ema50: ind.ema50.slice(testStart, testEnd),
+      rsi: ind.rsi.slice(testStart, testEnd),
+      atr: ind.atr.slice(testStart, testEnd),
+      macd: {
+        line: ind.macd.line.slice(testStart, testEnd),
+        signal: ind.macd.signal.slice(testStart, testEnd),
+        hist: ind.macd.hist.slice(testStart, testEnd),
+      },
+      obv: ind.obv.slice(testStart, testEnd),
+      bb: ind.bb ? ind.bb.slice(testStart, testEnd) : [],
+      stoch: {
+        k: ind.stoch.k.slice(testStart, testEnd),
+        d: ind.stoch.d.slice(testStart, testEnd),
+        j: ind.stoch.j.slice(testStart, testEnd),
+      },
+    };
+
+    const trainInd = {
+      sma20: ind.sma20.slice(0, trainEnd),
+      ema50: ind.ema50.slice(0, trainEnd),
+      rsi: ind.rsi.slice(0, trainEnd),
+      atr: ind.atr.slice(0, trainEnd),
+      macd: {
+        line: ind.macd.line.slice(0, trainEnd),
+        signal: ind.macd.signal.slice(0, trainEnd),
+        hist: ind.macd.hist.slice(0, trainEnd),
+      },
+      obv: ind.obv.slice(0, trainEnd),
+      bb: ind.bb ? ind.bb.slice(0, trainEnd) : [],
+      stoch: {
+        k: ind.stoch.k.slice(0, trainEnd),
+        d: ind.stoch.d.slice(0, trainEnd),
+        j: ind.stoch.j.slice(0, trainEnd),
+      },
+    };
+
+    const inSample = runStrategyPass(trainData, trainInd, params);
+    const outSample = runStrategyPass(testData, testInd, params);
+
+    folds.push({
+      fold: f + 1,
+      trainBars: trainEnd,
+      testBars: testEnd - testStart,
+      inSample,
+      outSample,
+      degradation: (inSample && outSample && inSample.sharpe > 0)
+        ? outSample.sharpe / inSample.sharpe
+        : null,
+    });
+  }
+  return folds;
+}
+
+// ================================================================
+// MONTE CARLO PERMUTATION TEST
+// Shuffle trade returns N times, see where real strategy ranks
+// ================================================================
+function monteCarlo(realTrades, nSims) {
+  if (!realTrades || realTrades < 5) return null;
+  // We simulate by permuting order of real returns
+  // Proxy: generate synthetic trade returns from normal dist matching real stats
+  // (we don't have raw trade list here — use the backtest equity approach)
+  return null; // placeholder — full version below uses trade list
+}
+
+function monteCarloFromRets(rets, nSims) {
+  if (!rets || rets.length < 5) return null;
+  const realSharpe = (() => {
+    const m = rets.reduce((a,b)=>a+b,0)/rets.length;
+    const sd = Math.sqrt(rets.map(r=>(r-m)**2).reduce((a,b)=>a+b,0)/Math.max(1,rets.length-1));
+    return sd > 0 ? m/sd : 0;
+  })();
+  const realWR = rets.filter(r=>r>0).length / rets.length;
+
+  // Shuffle returns nSims times, compute Sharpe each time
+  const simSharpes = [];
+  const arr = [...rets];
+  for (let s = 0; s < nSims; s++) {
+    // Fisher-Yates shuffle
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    const m = arr.reduce((a,b)=>a+b,0)/arr.length;
+    const sd = Math.sqrt(arr.map(r=>(r-m)**2).reduce((a,b)=>a+b,0)/Math.max(1,arr.length-1));
+    simSharpes.push(sd > 0 ? m/sd : 0);
+  }
+  simSharpes.sort((a,b) => a-b);
+
+  // p-value: fraction of simulations that beat real Sharpe
+  const rank = simSharpes.filter(s => s >= realSharpe).length;
+  const pValue = rank / nSims;
+  const percentile = (1 - pValue) * 100;
+
+  // Distribution buckets for histogram
+  const min = simSharpes[0], max = simSharpes[simSharpes.length-1];
+  const nBuckets = 20;
+  const bucketW = (max - min) / nBuckets || 0.1;
+  const hist = Array(nBuckets).fill(0).map((_, i) => ({
+    x: +(min + i * bucketW).toFixed(3),
+    count: 0,
+  }));
+  for (const v of simSharpes) {
+    const bi = Math.min(nBuckets-1, Math.floor((v - min) / bucketW));
+    hist[bi].count++;
+  }
+
+  return {
+    realSharpe: +realSharpe.toFixed(3),
+    realWR: +realWR.toFixed(3),
+    nSims,
+    pValue: +pValue.toFixed(4),
+    percentile: +percentile.toFixed(1),
+    significant: pValue < 0.05,
+    hist,
+    simMedianSharpe: +simSharpes[Math.floor(nSims/2)].toFixed(3),
+  };
+}
+
+// ================================================================
+// PARAMETER SWEEP (robustness test)
+// Vary zsEntry threshold and donchian period
+// ================================================================
+function paramSweep(data, ind) {
+  const zsThresholds = [-1.0, -1.25, -1.5, -1.75, -2.0];
+  const donPeriods = [10, 15, 20, 30, 40];
+  const defaultParams = { zsExit: 0, adxMin: 20, maxHold: 10, feePerSide: 0.001 };
+
+  const cells = [];
+  for (const zs of zsThresholds) {
+    for (const dp of donPeriods) {
+      const res = runStrategyPass(data, ind, { ...defaultParams, zsEntry: zs, donPeriod: dp });
+      cells.push({
+        zsEntry: zs,
+        donPeriod: dp,
+        sharpe: res ? +res.sharpe.toFixed(2) : null,
+        winRate: res ? +res.winRate.toFixed(2) : null,
+        trades: res ? res.trades : 0,
+      });
+    }
+  }
+  return { zsThresholds, donPeriods, cells };
+}
+
+// ================================================================
+// REGIME ANALYSIS
+// Split results by trending (ADX>25) vs choppy (ADX<25)
+// ================================================================
+function regimeAnalysis(data, ind) {
+  const adxResult = adx(data, 14);
+  const cl = data.map(b => b.close);
+  const n = data.length;
+
+  // Classify each bar
+  const trending = [], choppy = [];
+  for (let i = 0; i < n; i++) {
+    const av = adxResult.adx[i];
+    if (av == null) continue;
+    (av >= 25 ? trending : choppy).push(i);
+  }
+
+  const sliceByIdx = (idxArr) => {
+    if (idxArr.length < 10) return null;
+    // Build synthetic data slice from index list
+    const synData = idxArr.map(i => data[i]);
+    const synInd = {
+      sma20: idxArr.map(i => ind.sma20[i]),
+      ema50: idxArr.map(i => ind.ema50[i]),
+      rsi: idxArr.map(i => ind.rsi[i]),
+      atr: idxArr.map(i => ind.atr[i]),
+      macd: {
+        line: idxArr.map(i => ind.macd.line[i]),
+        signal: idxArr.map(i => ind.macd.signal[i]),
+        hist: idxArr.map(i => ind.macd.hist[i]),
+      },
+      obv: idxArr.map(i => ind.obv[i]),
+      bb: ind.bb ? idxArr.map(i => ind.bb[i]) : [],
+      stoch: {
+        k: idxArr.map(i => ind.stoch.k[i]),
+        d: idxArr.map(i => ind.stoch.d[i]),
+        j: idxArr.map(i => ind.stoch.j[i]),
+      },
+    };
+    return runStrategyPass(synData, synInd, { zsEntry: -1.5, zsExit: 0, donPeriod: 20, adxMin: 20, maxHold: 10, feePerSide: 0.001 });
+  };
+
+  return {
+    trendingBars: trending.length,
+    choppyBars: choppy.length,
+    trendingPct: +(trending.length / n * 100).toFixed(1),
+    trending: sliceByIdx(trending),
+    choppy: sliceByIdx(choppy),
+  };
+}
+
+// ================================================================
+// COLLECT RAW RETURNS FOR MONTE CARLO
+// ================================================================
+function collectRawReturns(data, ind) {
+  const params = { zsEntry: -1.5, zsExit: 0, donPeriod: 20, adxMin: 20, maxHold: 10, feePerSide: 0.001 };
+  const cl = data.map(b => b.close);
+  const n = data.length - 1;
+  const priceZ = zscore(cl, 20);
+  const donR = donchian(data, 20);
+  const don10 = donchian(data, 10);
+  const adxR = adx(data, 14);
+  const rets = [];
+
+  // Stat arb
+  let saPos = false, saEntry = 0, saBars = 0;
+  for (let i = 20; i <= n; i++) {
+    if (!saPos && priceZ[i] !== null && priceZ[i] < params.zsEntry) {
+      saPos = true; saEntry = cl[i]; saBars = 0;
+    } else if (saPos) {
+      saBars++;
+      if ((priceZ[i] !== null && priceZ[i] > params.zsExit) || saBars >= params.maxHold) {
+        rets.push(cl[i] / saEntry * 0.998 - 1);
+        saPos = false;
+      }
+    }
+  }
+  if (saPos) rets.push(cl[n] / saEntry * 0.998 - 1);
+
+  // CTA
+  let ctaPos = false, ctaEntry = 0;
+  for (let i = 20; i <= n; i++) {
+    const d = donR[i], d10 = don10[i];
+    if (!ctaPos && d && d.upper && cl[i] >= d.upper * 0.999 &&
+        adxR.adx[i] != null && adxR.adx[i] > params.adxMin) {
+      ctaPos = true; ctaEntry = cl[i];
+    } else if (ctaPos && d10 && d10.lower && cl[i] <= d10.lower) {
+      rets.push(cl[i] / ctaEntry * 0.998 - 1);
+      ctaPos = false;
+    }
+  }
+  if (ctaPos) rets.push(cl[n] / ctaEntry * 0.998 - 1);
+
+  // Factor
+  let fPos = false, fEntry = 0;
+  for (let i = 1; i <= n; i++) {
+    const longOk = ind.sma20[i] != null && ind.ema50[i] != null && ind.rsi[i] != null &&
+      ind.sma20[i] > ind.ema50[i] && ind.rsi[i] > 50;
+    if (!fPos && longOk) { fPos = true; fEntry = cl[i]; }
+    else if (fPos && !longOk) { rets.push(cl[i] / fEntry * 0.998 - 1); fPos = false; }
+  }
+  if (fPos) rets.push(cl[n] / fEntry * 0.998 - 1);
+
+  return rets;
+}
+
+// ================================================================
+// MASTER VALIDATOR — runs all 4 tests
+// ================================================================
+function computeValidator(data, ind) {
+  if (!data || data.length < 60) return null;
+
+  const defaultParams = { zsEntry: -1.5, zsExit: 0, donPeriod: 20, adxMin: 20, maxHold: 10, feePerSide: 0.001 };
+
+  // Full backtest baseline
+  const baseline = runStrategyPass(data, ind, defaultParams);
+
+  // Walk-forward (4 folds)
+  const nFolds = Math.min(4, Math.floor(data.length / 60));
+  const wfFolds = nFolds >= 2 ? walkForward(data, ind, defaultParams, nFolds) : null;
+
+  // Average walk-forward out-of-sample stats
+  let wfSummary = null;
+  if (wfFolds && wfFolds.length) {
+    const valid = wfFolds.filter(f => f.outSample);
+    if (valid.length) {
+      wfSummary = {
+        avgOutSharpe: +(valid.reduce((a,f) => a + (f.outSample.sharpe||0), 0) / valid.length).toFixed(3),
+        avgInSharpe: +(valid.reduce((a,f) => a + (f.inSample ? f.inSample.sharpe||0 : 0), 0) / valid.length).toFixed(3),
+        avgDegradation: +(valid.filter(f=>f.degradation!=null).reduce((a,f)=>a+f.degradation,0) / Math.max(1,valid.filter(f=>f.degradation!=null).length)).toFixed(3),
+        folds: valid.length,
+      };
+    }
+  }
+
+  // Monte Carlo (500 sims)
+  const rawRets = collectRawReturns(data, ind);
+  const mc = rawRets.length >= 5 ? monteCarloFromRets(rawRets, 500) : null;
+
+  // Parameter sweep
+  const sweep = paramSweep(data, ind);
+
+  // Regime analysis
+  const regime = regimeAnalysis(data, ind);
+
+  // Trade count quality rating
+  const trades = baseline ? baseline.trades : 0;
+  const tradeQuality = trades >= 300 ? "Professional" : trades >= 100 ? "Reliable" : trades >= 30 ? "Directional" : "Insufficient";
+  const tradeColor = trades >= 100 ? "green" : trades >= 30 ? "gold" : "red";
+
+  return { baseline, wfFolds, wfSummary, mc, sweep, regime, trades, tradeQuality, tradeColor, rawRets };
+}
+
+// ================================================================
+// REACT COMPONENT: ValidatorTab
+// ================================================================
+function ValidatorPanel({ data, ind, c, pct }) {
+  const [running, setRunning] = React.useState(false);
+  const [result, setResult] = React.useState(null);
+
+  const run = () => {
+    setRunning(true);
+    // Use setTimeout to let UI update before heavy compute
+    setTimeout(() => {
+      const r = computeValidator(data, ind);
+      setResult(r);
+      setRunning(false);
+    }, 30);
+  };
+
+  const cell = (label, value, color) =>
+    React.createElement("div", { style: { display:"flex", flexDirection:"column", gap:2 } },
+      React.createElement("span", { style: { fontSize:9, letterSpacing:".05em", textTransform:"uppercase", color:c.mut } }, label),
+      React.createElement("span", { style: { fontSize:13, fontWeight:600, color:color||c.ink, fontVariantNumeric:"tabular-nums" } }, value));
+
+  const sectionHead = (title, sub) =>
+    React.createElement("div", { style: { marginBottom:12 } },
+      React.createElement("div", { style: { fontFamily:"'Fraunces',Georgia,serif", fontSize:15, color:c.gold } }, title),
+      sub && React.createElement("div", { style: { fontSize:11, color:c.mut, marginTop:2 } }, sub));
+
+  const cardWrap = (children, accent) =>
+    React.createElement("div", {
+      style: { border:"1px solid "+c.line, borderLeft:"3px solid "+(accent||c.gold), background:c.panel2, borderRadius:8, padding:16, marginBottom:16 }
+    }, children);
+
+  if (!result && !running) return React.createElement("div", { style: { textAlign:"center", padding:"40px 20px" } },
+    React.createElement("div", { style: { fontSize:14, color:c.mut, marginBottom:16, lineHeight:1.6 } },
+      "Run a full professional-grade strategy validation: walk-forward testing, Monte Carlo permutation, parameter sensitivity sweep, and regime analysis."),
+    React.createElement("div", { style: { fontSize:11, color:c.mut, marginBottom:20, lineHeight:1.5 } },
+      "May take 2-3 seconds on 750 bars. All computation runs locally in your browser."),
+    React.createElement("button", {
+      onClick: run,
+      style: { background:c.gold, color:"#000", border:"none", borderRadius:6, padding:"10px 28px", fontSize:14, fontWeight:700, cursor:"pointer", letterSpacing:".06em" }
+    }, "▶  Run Validator"));
+
+  if (running) return React.createElement("div", { style: { textAlign:"center", padding:"60px 20px", color:c.mut, fontSize:14 } },
+    "Running 500 Monte Carlo simulations + walk-forward folds…");
+
+  if (!result) return React.createElement("div", { style: { color:c.mut, padding:20 } }, "Need at least 60 bars.");
+
+  const { baseline, wfFolds, wfSummary, mc, sweep, regime, trades, tradeQuality, tradeColor } = result;
+  const tCol = tradeColor === "green" ? c.green : tradeColor === "gold" ? c.gold : c.red;
+
+  return React.createElement("div", null,
+
+    // ── HEADER SUMMARY ──
+    cardWrap(React.createElement("div", null,
+      sectionHead("Strategy Validation Summary", "How a professional quant would assess this strategy"),
+      React.createElement("div", { style: { display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))", gap:"10px 16px", marginBottom:14 } },
+        cell("Total trades", String(trades), tCol),
+        cell("Trade quality", tradeQuality, tCol),
+        cell("Baseline Sharpe", baseline ? baseline.sharpe.toFixed(2) : "—", baseline&&baseline.sharpe>0?c.green:c.red),
+        cell("Baseline win rate", baseline ? pct(baseline.winRate,0) : "—", c.ink),
+        cell("Profit factor", baseline&&baseline.profitFactor!=null ? (baseline.profitFactor===Infinity?"∞":baseline.profitFactor.toFixed(2)) : "—", baseline&&baseline.profitFactor>=1?c.green:c.red),
+        cell("Max drawdown", baseline ? pct(baseline.maxDD) : "—", c.red),
+        cell("Total return", baseline ? pct(baseline.totalRet) : "—", baseline&&baseline.totalRet>=0?c.green:c.red),
+        cell("By strategy", baseline ? "SA:"+baseline.byStype.statarb+" CTA:"+baseline.byStype.cta+" F:"+baseline.byStype.factor : "—", c.ink)),
+      trades < 30 && React.createElement("div", { style: { background:c.red+"22", border:"1px solid "+c.red, borderRadius:6, padding:"8px 12px", fontSize:12, color:c.red, lineHeight:1.5 } },
+        "⚠ Only "+trades+" trades — statistically meaningless. Win rate and Sharpe cannot be trusted with fewer than 30 trades. Fetch more history or use a weekly timeframe for more signals."),
+      trades >= 30 && trades < 100 && React.createElement("div", { style: { background:c.gold+"22", border:"1px solid "+c.gold, borderRadius:6, padding:"8px 12px", fontSize:12, color:c.gold, lineHeight:1.5 } },
+        "⚠ "+trades+" trades — directionally useful but wide confidence intervals. Results will have ±15-20% variance. Target 100+ trades for reliable statistics."),
+      trades >= 100 && React.createElement("div", { style: { background:c.green+"22", border:"1px solid "+c.green, borderRadius:6, padding:"8px 12px", fontSize:12, color:c.green, lineHeight:1.5 } },
+        "✓ "+trades+" trades — statistically reliable sample. Results can be trusted as directional evidence.")),
+    c.gold),
+
+    // ── WALK-FORWARD ──
+    cardWrap(React.createElement("div", null,
+      sectionHead("Walk-Forward Test", "Train on past folds, test on unseen future — detects overfitting"),
+      wfFolds && wfFolds.length ? React.createElement("div", null,
+        React.createElement("div", { style: { overflowX:"auto", marginBottom:12 } },
+          React.createElement("table", { style: { width:"100%", borderCollapse:"collapse", fontSize:12 } },
+            React.createElement("thead", null,
+              React.createElement("tr", null,
+                ["Fold","Train bars","Test bars","In-sample Sharpe","Out-of-sample Sharpe","Degradation","Out trades","Out win rate"].map(h =>
+                  React.createElement("th", { key:h, style: { padding:"6px 10px", textAlign:"left", color:c.mut, fontSize:10, letterSpacing:".05em", borderBottom:"1px solid "+c.line, whiteSpace:"nowrap" } }, h)))),
+            React.createElement("tbody", null,
+              wfFolds.map(f =>
+                React.createElement("tr", { key:f.fold },
+                  [
+                    f.fold,
+                    f.trainBars,
+                    f.testBars,
+                    f.inSample ? f.inSample.sharpe.toFixed(2) : "—",
+                    f.outSample ? React.createElement("span", { style: { color: f.outSample.sharpe > 0 ? c.green : c.red, fontWeight:600 } }, f.outSample.sharpe.toFixed(2)) : "—",
+                    f.degradation != null ? React.createElement("span", { style: { color: f.degradation >= 0.5 ? c.green : f.degradation >= 0.2 ? c.gold : c.red, fontWeight:600 } }, (f.degradation*100).toFixed(0)+"%") : "—",
+                    f.outSample ? f.outSample.trades : "—",
+                    f.outSample ? pct(f.outSample.winRate, 0) : "—",
+                  ].map((v,i) => React.createElement("td", { key:i, style: { padding:"6px 10px", borderBottom:"1px solid "+c.line+"44" } }, v)))))),
+        wfSummary && React.createElement("div", { style: { display:"flex", gap:20, flexWrap:"wrap", marginTop:8, paddingTop:8, borderTop:"1px solid "+c.line } },
+          cell("Avg in-sample Sharpe", wfSummary.avgInSharpe.toFixed(2), c.ink),
+          cell("Avg out-of-sample Sharpe", wfSummary.avgOutSharpe.toFixed(2), wfSummary.avgOutSharpe>0?c.green:c.red),
+          cell("Avg degradation", (wfSummary.avgDegradation*100).toFixed(0)+"%",
+            wfSummary.avgDegradation>=0.5?c.green:wfSummary.avgDegradation>=0.2?c.gold:c.red),
+          cell("Verdict", wfSummary.avgDegradation>=0.5?"Robust — holds up out-of-sample":wfSummary.avgDegradation>=0.2?"Marginal — partial decay":"Overfit — collapses out-of-sample",
+            wfSummary.avgDegradation>=0.5?c.green:wfSummary.avgDegradation>=0.2?c.gold:c.red))))
+      : React.createElement("div", { style: { color:c.mut, fontSize:12 } }, "Need 120+ bars for walk-forward folds."),
+      React.createElement("div", { style: { fontSize:10, color:c.mut, marginTop:10, lineHeight:1.5 } },
+        "Degradation = out-of-sample Sharpe ÷ in-sample Sharpe. Professional target: ≥50%. Below 20% = overfit.")),
+    c.blue),
+
+    // ── MONTE CARLO ──
+    cardWrap(React.createElement("div", null,
+      sectionHead("Monte Carlo Permutation Test", "500 random trade shuffles — could luck explain these results?"),
+      mc ? React.createElement("div", null,
+        React.createElement("div", { style: { display:"flex", gap:20, flexWrap:"wrap", marginBottom:14 } },
+          cell("Real Sharpe", mc.realSharpe.toFixed(2), mc.realSharpe>0?c.green:c.red),
+          cell("Random median Sharpe", mc.simMedianSharpe.toFixed(2), c.mut),
+          cell("Percentile rank", mc.percentile.toFixed(1)+"%", mc.percentile>=95?c.green:mc.percentile>=80?c.gold:c.red),
+          cell("p-value", mc.pValue.toFixed(3), mc.pValue<0.05?c.green:mc.pValue<0.1?c.gold:c.red),
+          cell("Statistically significant", mc.significant?"Yes (p<0.05)":"No (p≥0.05)", mc.significant?c.green:c.red),
+          cell("Trade sample", String(result.rawRets.length)+" trades", result.rawRets.length>=30?c.green:c.red)),
+        React.createElement("div", { style: { marginBottom:8, fontSize:11, color:c.mut } },
+          "Distribution of Sharpe ratios from 500 random shuffles. Your strategy (gold line) vs random:"),
+        React.createElement(Recharts.ResponsiveContainer, { width:"100%", height:120 },
+          React.createElement(Recharts.BarChart, { data:mc.hist, margin:{top:4,right:8,left:0,bottom:0}, barCategoryGap:"2%" },
+            React.createElement(Recharts.CartesianGrid, { stroke:c.line, strokeDasharray:"2 4", vertical:false }),
+            React.createElement(Recharts.XAxis, { dataKey:"x", tick:{fill:c.mut,fontSize:8}, minTickGap:20, stroke:c.line }),
+            React.createElement(Recharts.YAxis, { tick:{fill:c.mut,fontSize:8}, stroke:c.line, width:28 }),
+            React.createElement(Recharts.Tooltip, { contentStyle:{background:c.panel2,border:"1px solid "+c.line,fontSize:10},
+              formatter:(v)=>[v+" simulations","Count"] }),
+            React.createElement(Recharts.Bar, { dataKey:"count", fill:c.mut+"88", radius:[2,2,0,0] }),
+            React.createElement(Recharts.ReferenceLine, { x:mc.hist.reduce((best,b)=>Math.abs(b.x-mc.realSharpe)<Math.abs(best.x-mc.realSharpe)?b:best,mc.hist[0]).x,
+              stroke:c.gold, strokeWidth:2, label:{value:"Yours",fill:c.gold,fontSize:9,position:"top"} }))),
+        React.createElement("div", { style: { fontSize:11, color: mc.significant?c.green:c.red, marginTop:8, fontWeight:600 } },
+          mc.significant
+            ? "✓ Strategy beats "+mc.percentile.toFixed(0)+"% of random shuffles (p="+mc.pValue.toFixed(3)+") — results are unlikely due to luck alone."
+            : "✗ Strategy only beats "+mc.percentile.toFixed(0)+"% of random shuffles (p="+mc.pValue.toFixed(3)+") — results may be luck. Need more trades or a stronger edge."))
+      : React.createElement("div", { style: { color:c.mut, fontSize:12 } }, "Need at least 5 trades for Monte Carlo."),
+      React.createElement("div", { style: { fontSize:10, color:c.mut, marginTop:10, lineHeight:1.5 } },
+        "p < 0.05 means less than 5% chance the results are random — the standard scientific significance threshold.")),
+    c.violet),
+
+    // ── PARAMETER SWEEP ──
+    cardWrap(React.createElement("div", null,
+      sectionHead("Parameter Sensitivity Sweep", "Vary z-score threshold and Donchian period ±40% — robust strategies stay green"),
+      React.createElement("div", { style: { overflowX:"auto" } },
+        React.createElement("table", { style: { borderCollapse:"collapse", fontSize:11, minWidth:400 } },
+          React.createElement("thead", null,
+            React.createElement("tr", null,
+              React.createElement("th", { style: { padding:"6px 10px", color:c.mut, fontSize:10, borderBottom:"1px solid "+c.line } }, "Z-entry \\ Don period"),
+              sweep.donPeriods.map(dp =>
+                React.createElement("th", { key:dp, style: { padding:"6px 12px", color:c.mut, fontSize:10, borderBottom:"1px solid "+c.line } }, dp+" bars")))),
+          React.createElement("tbody", null,
+            sweep.zsThresholds.map(zs =>
+              React.createElement("tr", { key:zs },
+                React.createElement("td", { style: { padding:"6px 10px", color:c.mut, fontSize:10, fontFamily:"monospace", borderRight:"1px solid "+c.line } }, "z<"+zs),
+                sweep.donPeriods.map(dp => {
+                  const cell2 = sweep.cells.find(c2 => c2.zsEntry===zs && c2.donPeriod===dp);
+                  const sh = cell2 && cell2.sharpe !== null ? cell2.sharpe : null;
+                  const bg = sh === null ? "transparent" : sh >= 0.3 ? c.green+"33" : sh >= 0.1 ? c.gold+"33" : sh >= 0 ? c.ink+"11" : c.red+"22";
+                  const col = sh === null ? c.mut : sh >= 0.3 ? c.green : sh >= 0.1 ? c.gold : sh >= 0 ? c.ink : c.red;
+                  return React.createElement("td", { key:dp, style: { padding:"6px 12px", textAlign:"center", background:bg, fontFamily:"monospace", fontSize:12, fontWeight: sh!==null&&sh>=0.1?600:400, color:col } },
+                    sh !== null ? sh.toFixed(2) : "—");
+                })))))),
+      React.createElement("div", { style: { fontSize:10, color:c.mut, marginTop:10, lineHeight:1.5 } },
+        "Each cell = Sharpe ratio for that parameter combination. Green (≥0.30) = strong. Gold (≥0.10) = moderate. Red (<0) = losing. A robust strategy shows consistent colour across the grid — not a single bright spot surrounded by red.")),
+    c.green),
+
+    // ── REGIME ANALYSIS ──
+    cardWrap(React.createElement("div", null,
+      sectionHead("Regime Analysis", "Does the strategy work in trending vs choppy markets?"),
+      React.createElement("div", { style: { display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))", gap:16, marginBottom:12 } },
+        React.createElement("div", { style: { background:c.panel, border:"1px solid "+c.line, borderRadius:6, padding:12 } },
+          React.createElement("div", { style: { fontSize:10, letterSpacing:".08em", textTransform:"uppercase", color:c.gold, marginBottom:8 } }, "Trending Regime (ADX ≥ 25)"),
+          React.createElement("div", { style: { fontSize:11, color:c.mut, marginBottom:10 } }, regime.trendingBars+" bars ("+regime.trendingPct+"% of history)"),
+          regime.trending ? React.createElement("div", { style: { display:"flex", flexDirection:"column", gap:6 } },
+            cell("Trades", String(regime.trending.trades), c.ink),
+            cell("Win rate", pct(regime.trending.winRate,0), c.ink),
+            cell("Sharpe", regime.trending.sharpe.toFixed(2), regime.trending.sharpe>0?c.green:c.red),
+            cell("Expectancy/trade", pct(regime.trending.expectancy), regime.trending.expectancy>0?c.green:c.red))
+          : React.createElement("div", { style: { color:c.mut, fontSize:11 } }, "Not enough trending bars.")),
+        React.createElement("div", { style: { background:c.panel, border:"1px solid "+c.line, borderRadius:6, padding:12 } },
+          React.createElement("div", { style: { fontSize:10, letterSpacing:".08em", textTransform:"uppercase", color:c.blue, marginBottom:8 } }, "Choppy Regime (ADX < 25)"),
+          React.createElement("div", { style: { fontSize:11, color:c.mut, marginBottom:10 } }, regime.choppyBars+" bars ("+Math.round(100-regime.trendingPct)+"% of history)"),
+          regime.choppy ? React.createElement("div", { style: { display:"flex", flexDirection:"column", gap:6 } },
+            cell("Trades", String(regime.choppy.trades), c.ink),
+            cell("Win rate", pct(regime.choppy.winRate,0), c.ink),
+            cell("Sharpe", regime.choppy.sharpe.toFixed(2), regime.choppy.sharpe>0?c.green:c.red),
+            cell("Expectancy/trade", pct(regime.choppy.expectancy), regime.choppy.expectancy>0?c.green:c.red))
+          : React.createElement("div", { style: { color:c.mut, fontSize:11 } }, "Not enough choppy bars."))),
+      regime.trending && regime.choppy && React.createElement("div", { style: {
+        padding:"10px 12px", borderRadius:6, border:"1px solid "+c.line,
+        background: regime.trending.sharpe > regime.choppy.sharpe ? c.green+"11" : c.blue+"11",
+        fontSize:12, color:c.ink, lineHeight:1.5
+      } },
+        regime.trending.sharpe > regime.choppy.sharpe
+          ? "✓ Strategy performs better in trending markets (Sharpe "+regime.trending.sharpe.toFixed(2)+" vs "+regime.choppy.sharpe.toFixed(2)+"). This is expected for CTA/momentum approaches — the stat-arb component helps in choppy conditions."
+          : "✓ Strategy performs better in choppy markets (Sharpe "+regime.choppy.sharpe.toFixed(2)+" vs "+regime.trending.sharpe.toFixed(2)+"). The mean-reversion component is doing the heavy lifting."),
+      React.createElement("div", { style: { fontSize:10, color:c.mut, marginTop:10, lineHeight:1.5 } },
+        "Real quant funds target regime-agnostic returns. If your strategy only works in one regime, position-size down when the other regime is active.")),
+    c.gold),
+
+    // ── RE-RUN BUTTON ──
+    React.createElement("div", { style: { textAlign:"center", marginTop:8 } },
+      React.createElement("button", {
+        onClick: run,
+        style: { background:"transparent", color:c.mut, border:"1px solid "+c.line, borderRadius:6, padding:"8px 20px", fontSize:12, cursor:"pointer" }
+      }, "↺  Re-run Validator"))
+  );
 }
 
 function App() {
@@ -2207,16 +2642,14 @@ function App() {
   // DCF
   const [d, setD] = useState({
     fcf0: 100000,
-    g1: 0.08,
+    g1: 0.12,   // 12% starting point — adjust down for slow growers, up for hypergrowth
     years1: 5,
     years2: 5,
-    gt: 0.025,
-    wacc: 0.085,
+    gt: 0.025,  // ~nominal GDP; use 0.03 for USD-centric businesses
+    wacc: 0.10, // 10% default; build precisely with CAPM below
     netDebt: -50000,
     shares: 15000,
-    price: 190,
-    mos: 0.2,
-    exitMult: 15
+    price: 190
   });
   const setDcf = k => v => setD(s => ({
     ...s,
@@ -2235,13 +2668,14 @@ function App() {
       fcf0: +(v / 1e6).toFixed(0)
     }));
   }
+  const [benchData, setBenchData] = useState([]);  // SPY closes for RS scoring
   const [showCapm, setShowCapm] = useState(false);
   const [capm, setCapm] = useState({
-    rf: 0.043,
-    beta: 1.15,
-    erp: 0.05,
-    kd: 0.045,
-    tax: 0.21,
+    rf: 0.043,   // ~10-yr Treasury; update to current rate
+    beta: 1.15,   // auto-fills from Finnhub on fetch
+    erp: 0.055,   // Damodaran Jan-2026 implied ERP for US market
+    kd: 0.05,     // typical IG corp bond yield 2025-26
+    tax: 0.21,    // US statutory; adjust for effective rate
     eVal: 2900000,
     dVal: 100000
   });
@@ -2251,7 +2685,7 @@ function App() {
   }));
   const capmRes = useMemo(() => capmWACC(capm), [capm]);
   const last = data[data.length - 1];
-  const piv = useMemo(() => pivotPoints(priorSessionHLC(data)), [data]);
+  const piv = useMemo(() => pivotPoints(last), [last]);
   const sw = useMemo(() => swingLevels(data), [data]);
   const fibs = useMemo(() => fib(data), [data]);
   const dcf = useMemo(() => runDCF(d), [d]);
@@ -2274,7 +2708,7 @@ function App() {
     };
   }, [data]);
   const sig = useMemo(() => computeSignals(data, ind), [data, ind]);
-  const read = useMemo(() => computeRead(data, ind, dcf), [data, ind, dcf]);
+  const read = useMemo(() => computeRead(data, ind, dcf, benchData), [data, ind, dcf, benchData]);
   const finalSig = useMemo(() => {
     const n = data.length - 1;
     if (n < 1) return null;
@@ -2291,32 +2725,15 @@ function App() {
     const support = sw && sw.support && sw.support.length ? sw.support[0] : null;
     const resistance = sw && sw.resistance && sw.resistance.length ? sw.resistance[0] : null;
     return getFinalBuySellSignal({
-      price,
-      ema50: ind.ema50[n],
-      ema200: e200,
-      rsi: ind.rsi[n],
-      macd: ind.macd.line[n],
-      macdSignal: ind.macd.signal[n],
-      macdHist: ind.macd.hist[n],
-      prevMacd: ind.macd.line[n - 1],
-      prevMacdSignal: ind.macd.signal[n - 1],
-      prevMacdHist: ind.macd.hist[n - 1],
-      k: ind.stoch.k[n],
-      d: ind.stoch.d[n],
-      j: ind.stoch.j[n],
-      prevK: ind.stoch.k[n - 1],
-      prevD: ind.stoch.d[n - 1],
-      prevJ: ind.stoch.j[n - 1],
-      volume: data[n].volume,
-      avgVolume20,
-      obv: ind.obv[n],
-      obvMA20,
-      support,
-      resistance,
-      relativeStrength: undefined,
-      relativeStrengthMA50: undefined,
-      atrPct,
-      dcfUpsidePct: dcf.valid ? dcf.upside : undefined
+      price, ema50: ind.ema50[n], ema200: e200,
+      rsi: ind.rsi[n], macd: ind.macd.line[n], macdSignal: ind.macd.signal[n], macdHist: ind.macd.hist[n],
+      prevMacd: ind.macd.line[n-1], prevMacdSignal: ind.macd.signal[n-1], prevMacdHist: ind.macd.hist[n-1],
+      k: ind.stoch.k[n], d: ind.stoch.d[n], j: ind.stoch.j[n],
+      prevK: ind.stoch.k[n-1], prevD: ind.stoch.d[n-1], prevJ: ind.stoch.j[n-1],
+      volume: data[n].volume, avgVolume20, obv: ind.obv[n], obvMA20,
+      support, resistance,
+      relativeStrength: undefined, relativeStrengthMA50: undefined,
+      atrPct, dcfUpsidePct: dcf.valid ? dcf.upside : undefined
     });
   }, [data, ind, sw, dcf]);
   const bt = useMemo(() => backtestEngine(data, ind), [data, ind]);
@@ -2332,9 +2749,17 @@ function App() {
     buy: signalsOn && sig.buys.has(i) ? b.low : null,
     sell: signalsOn && sig.sells.has(i) ? b.high : null
   }));
+  // DCF defaults reset on every new ticker fetch so stale assumptions don't carry over
+  function dcfDefaults() {
+    return { g1: 0.12, years1: 5, years2: 5, gt: 0.025 };
+  }
+
   async function fetchLive(pd = period) {
     setLoading(true);
     setNote("Fetching…");
+    // Reset growth assumptions and benchmark on every new fetch
+    setD(prev => ({ ...prev, ...dcfDefaults() }));
+    setBenchData([]);
     try {
       const r = await fetch(`${backend}/api/candles?code=${encodeURIComponent(code)}&count=750&period=${pd}`);
       const j = await r.json();
@@ -2349,6 +2774,10 @@ function App() {
           price: s.last_price ?? prev.price,
           shares: s.issued_shares ? +(s.issued_shares / 1e6).toFixed(0) : prev.shares
         }));
+        // Auto-populate beta into CAPM builder if Finnhub returned it
+        if (s.beta != null) {
+          setCapm(prev => ({ ...prev, beta: +s.beta.toFixed(3) }));
+        }
       } catch (_) {}
       try {
         const f = await (await fetch(`${backend}/api/fundamentals?code=${encodeURIComponent(code)}&years=3`)).json();
@@ -2356,6 +2785,11 @@ function App() {
           setFcfHist(f.history);
           applyBase(fcfMode, f.history);
           extra = ` · FCF (${fcfMode === "avg" ? "3-yr avg" : fcfMode === "exsbc" ? "ex-SBC" : "FY" + f.fiscal_year}) from SEC EDGAR`;
+        }
+        // Auto-populate net debt from EDGAR balance sheet (negative = net cash)
+        if (f.net_debt != null) {
+          setD(prev => ({ ...prev, netDebt: +(f.net_debt / 1e6).toFixed(0) }));
+          extra += ` · Net ${f.net_debt < 0 ? "cash" : "debt"} ${(Math.abs(f.net_debt)/1e9).toFixed(1)}B`;
         }
       } catch (_) {}
       try {
@@ -2368,6 +2802,12 @@ function App() {
         setNewsItems([]);
         setNewsNote("News needs FINNHUB_KEY set on the backend.");
       }
+      // Fetch SPY benchmark for relative-strength calculation (best-effort)
+      try {
+        const bk = await (await fetch(`${backend}/api/benchmark?count=120&period=${pd}`)).json();
+        if (bk.bars && bk.bars.length) setBenchData(bk.bars.map(b => b.close));
+      } catch (_) {}
+      // Fetch analyst views (best-effort)
       setAnalyst(null);
       try {
         const a = await (await fetch(`${backend}/api/analyst?code=${encodeURIComponent(code)}`)).json();
@@ -2711,6 +3151,15 @@ function App() {
       width: 100,
       textTransform: "uppercase"
     }
+  }), /*#__PURE__*/React.createElement("input", {
+    value: backend,
+    onChange: e => setBackend(e.target.value),
+    placeholder: "https://app.vercel.app",
+    style: {
+      ...inputStyle,
+      width: 185,
+      fontSize: 12
+    }
   }), /*#__PURE__*/React.createElement("button", {
     onClick: () => fetchLive(),
     disabled: loading,
@@ -2756,7 +3205,7 @@ function App() {
       gap: 4,
       padding: "16px 22px 0"
     }
-  }, [["tech", "Technical (S/R + indicators)"], ["val", "Valuation (DCF)"], ["news", "News"]].map(([k, lbl]) => /*#__PURE__*/React.createElement("button", {
+  }, [["tech", "Technical (S/R + indicators)"], ["val", "Valuation (DCF)"], ["quant", "Quant Strategy"], ["validator", "Strategy Validator"], ["news", "News"]].map(([k, lbl]) => /*#__PURE__*/React.createElement("button", {
     key: k,
     onClick: () => setTab(k),
     style: {
@@ -2782,10 +3231,7 @@ function App() {
       borderRadius: "0 10px 10px 10px",
       padding: 18
     }
-  }, finalSig && /*#__PURE__*/React.createElement(FinalReadCard, {
-    sig: finalSig,
-    c: c
-  }), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       justifyContent: "space-between",
@@ -2880,7 +3326,8 @@ function App() {
     style: {
       color: c.red
     }
-  }, sig.sellN, " sell"))), /*#__PURE__*/React.createElement("div", {
+  }, sig.sellN, " sell"))), finalSig && /*#__PURE__*/React.createElement(FinalReadCard, { sig: finalSig, c: c }),
+  /*#__PURE__*/React.createElement("div", {
     style: {
       marginBottom: 12,
       padding: "12px 14px",
@@ -2925,11 +3372,7 @@ function App() {
       borderTop: `1px solid ${c.line}`,
       paddingTop: 8
     }
-  }, /*#__PURE__*/React.createElement("b", null, "Net:"), " ", read.summary), /*#__PURE__*/React.createElement(BacktestCard, {
-    bt: bt,
-    c: c,
-    pct: pct
-  })), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("b", null, "Net:"), " ", read.summary), /*#__PURE__*/React.createElement(BacktestCard, { bt: bt, c: c, pct: pct })), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 8,
@@ -3168,17 +3611,9 @@ function App() {
       borderRadius: "0 10px 10px 10px",
       padding: 18
     }
-  }, /*#__PURE__*/React.createElement(DcfInsightCard, {
-    dcf: dcf,
-    c: c,
-    pct: pct
-  }), /*#__PURE__*/React.createElement(AnalystCard, {
-    analyst: analyst,
-    dcf: dcf,
-    c: c,
-    pct: pct,
-    price: d.price
-  }), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement(DcfInsightCard, { dcf: dcf, c: c, pct: pct }),
+  /*#__PURE__*/React.createElement(AnalystCard, { analyst: analyst, dcf: dcf, c: c, pct: pct, price: d.price }),
+  /*#__PURE__*/React.createElement("div", {
     style: {
       border: `1px solid ${c.line}`,
       borderRadius: 8,
@@ -3624,7 +4059,36 @@ function App() {
       marginTop: 14,
       lineHeight: 1.5
     }
-  }, "Headlines are pulled live and unfiltered \u2014 treat them as raw inputs, not verified facts, and click through to the source before acting on anything."))));
+  }, "Headlines are pulled live and unfiltered \u2014 treat them as raw inputs, not verified facts, and click through to the source before acting on anything.")))
+  , tab === "quant" && /*#__PURE__*/React.createElement("div", {
+    className: "rise",
+    style: {
+      ...card,
+      borderRadius: "0 10px 10px 10px",
+      padding: 18
+    }
+  }, /*#__PURE__*/React.createElement(QuantTab, {
+    data: data,
+    ind: ind,
+    dcf: dcf,
+    c: c,
+    pct: pct,
+    fmt: fmt
+  }))
+  , tab === "validator" && /*#__PURE__*/React.createElement("div", {
+    className: "rise",
+    style: {
+      ...card,
+      borderRadius: "0 10px 10px 10px",
+      padding: 18
+    }
+  }, /*#__PURE__*/React.createElement(ValidatorPanel, {
+    data: data,
+    ind: ind,
+    c: c,
+    pct: pct
+  }))
+  );
 }
 ReactDOM.createRoot(document.getElementById('root')).render(/*#__PURE__*/React.createElement(App, null));</script>
 </body></html>
