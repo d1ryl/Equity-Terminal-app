@@ -3497,15 +3497,6 @@ function App() {
       width: 100,
       textTransform: "uppercase"
     }
-  }), /*#__PURE__*/React.createElement("input", {
-    value: backend,
-    onChange: e => setBackend(e.target.value),
-    placeholder: "https://app.vercel.app",
-    style: {
-      ...inputStyle,
-      width: 185,
-      fontSize: 12
-    }
   }), /*#__PURE__*/React.createElement("button", {
     onClick: () => fetchLive(),
     disabled: loading,
