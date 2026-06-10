@@ -832,54 +832,97 @@ const EXPLAIN = {
 };
 
 // ---- multi-stage DCF + CAPM ----
-function runDCF({
-  fcf0,
-  g1,
-  years1,
-  years2,
-  gt,
-  wacc,
-  netDebt,
-  shares,
-  price
-}) {
-  const proj = [];
-  let pvSum = 0;
-  let f = fcf0;
-  const N = Math.max(0, Math.round(years1) + Math.round(years2));
-  for (let t = 1; t <= N; t++) {
-    let g;
-    if (t <= years1) g = g1;else {
-      const k = t - years1;
-      g = g1 + (gt - g1) * (k / years2);
+function runDCF(d) {
+  const {
+    fcf0, g1, years1, years2, gt, wacc, netDebt, shares, price,
+    exitMultiple, bearG, baseG, bullG, bearProb, bullProb,
+    fcfMargin, revenue0
+  } = d;
+
+  // ── helper: project one scenario ──
+  function projectScenario(fcfStart, growthRate) {
+    const N = Math.max(0, Math.round(years1) + Math.round(years2));
+    const proj = [];
+    let pvSum = 0, f = fcfStart;
+    for (let t = 1; t <= N; t++) {
+      const g = t <= years1 ? growthRate
+        : growthRate + (gt - growthRate) * ((t - years1) / years2);
+      f = f * (1 + g);
+      const pv = f / Math.pow(1 + wacc, t);
+      pvSum += pv;
+      proj.push({ year: "Y" + t, fcf: f, pv, phase: t <= years1 ? "growth" : "fade" });
     }
-    f = f * (1 + g);
-    const pv = f / Math.pow(1 + wacc, t);
-    pvSum += pv;
-    proj.push({
-      year: `Y${t}`,
-      fcf: f,
-      pv,
-      phase: t <= years1 ? "growth" : "fade"
-    });
+    const valid = wacc > gt && N > 0;
+    // Terminal value: blend perpetuity + exit multiple
+    const tvPerpetuity  = valid ? f * (1 + gt) / (wacc - gt) : NaN;
+    const tvExitMult    = (exitMultiple || 0) > 0 ? f * exitMultiple : NaN;
+    // Weight: 50/50 perpetuity vs exit multiple (Goldman typically uses exit multiple as primary)
+    const tvBlended = (!isNaN(tvPerpetuity) && !isNaN(tvExitMult))
+      ? tvExitMult * 0.60 + tvPerpetuity * 0.40
+      : !isNaN(tvExitMult) ? tvExitMult : tvPerpetuity;
+    const pvTV = isFinite(tvBlended) ? tvBlended / Math.pow(1 + wacc, N) : NaN;
+    const ev = pvSum + pvTV;
+    const equity = ev - netDebt;
+    const perShare = shares > 0 ? equity / shares : NaN;
+    const tvPct = ev > 0 ? pvTV / ev : NaN;
+    return { proj, pvSum, tvPerpetuity, tvExitMult, tvBlended, pvTV, ev, equity, perShare, tvPct, valid, N };
   }
-  const valid = wacc > gt && N > 0;
-  const tv = valid ? f * (1 + gt) / (wacc - gt) : NaN;
-  const pvTV = valid ? tv / Math.pow(1 + wacc, N) : NaN;
-  const ev = pvSum + pvTV,
-    equity = ev - netDebt,
-    perShare = equity / shares;
+
+  // Use revenue-driven FCF if revenue0 is set
+  const baseFCF = revenue0 > 0 && fcfMargin > 0 ? revenue0 * fcfMargin : fcf0;
+
+  // ── Three scenarios ──
+  const base = projectScenario(baseFCF, g1);
+  const bear = projectScenario(baseFCF, bearG != null ? bearG : g1 * 0.5);
+  const bull = projectScenario(baseFCF, bullG != null ? bullG : g1 * 1.5);
+
+  // ── Probability-weighted (Goldman "blended price target") ──
+  const bP  = Math.max(0, Math.min(1, bearProb || 0.25));
+  const buP = Math.max(0, Math.min(1, bullProb || 0.25));
+  const baP = Math.max(0, 1 - bP - buP);
+  const wtdPerShare = bear.perShare * bP + base.perShare * baP + bull.perShare * buP;
+  const wtdUpside   = wtdPerShare / price - 1;
+
+  // ── Margin of safety (20% discount to base) ──
+  const buyBelow = base.perShare * 0.80;
+
+  // ── Assumption warnings ──
+  const warns = [];
+  if (base.tvPct > 0.80)  warns.push("Terminal value >80% of EV — very sensitive to WACC/growth assumptions.");
+  if (wacc > 0.13)         warns.push("WACC > 13% — unusually high. A 1% WACC error moves value ±15-25%. Verify CAPM inputs.");
+  if (wacc < 0.07)         warns.push("WACC < 7% — unusually low. Ensure you're using nominal (not real) rates.");
+  if (g1 > 0.25)           warns.push("FCF growth > 25% — only justified for early-stage hypergrowth companies.");
+  if (Math.abs(gt - wacc) < 0.01) warns.push("Terminal growth ≈ WACC — model is unstable near this boundary.");
+  if (shares > 4000)       warns.push("Shares > 4,000M — may include options/warrants from EDGAR. Verify basic share count.");
+
   return {
-    proj,
-    pvSum,
-    tv,
-    pvTV,
-    ev,
-    equity,
-    perShare,
-    upside: perShare / price - 1,
-    valid,
-    N
+    // Base scenario (primary display)
+    proj: base.proj, pvSum: base.pvSum,
+    tv: base.tvBlended, pvTV: base.pvTV,
+    ev: base.ev, equity: base.equity,
+    perShare: base.perShare,
+    tvWeight: base.tvPct,
+    upside: base.perShare / price - 1,
+    valid: base.valid, N: base.N,
+    buyBelow,
+    // Exit multiple valuation
+    perShareExit: base.tvExitMult && shares > 0
+      ? (base.pvSum + base.tvExitMult / Math.pow(1 + wacc, base.N) - netDebt) / shares
+      : null,
+    // Perpetuity only
+    perSharePerpetuity: base.tvPerpetuity && shares > 0
+      ? (base.pvSum + base.tvPerpetuity / Math.pow(1 + wacc, base.N) - netDebt) / shares
+      : null,
+    perShareBlended: base.perShare,
+    // Scenario table
+    scenarios: {
+      bear: { perShare: bear.perShare, upside: bear.perShare / price - 1, growth: bearG },
+      base: { perShare: base.perShare, upside: base.perShare / price - 1, growth: g1 },
+      bull: { perShare: bull.perShare, upside: bull.perShare / price - 1, growth: bullG },
+    },
+    scenarioProbs: { bear: bP, base: baP, bull: buP },
+    wtdPerShare, wtdUpside,
+    warns,
   };
 }
 function capmWACC({
@@ -1338,25 +1381,44 @@ function BacktestCard({ bt, c, pct }) {
 }
 
 function DcfInsightCard({ dcf, c, pct, d }) {
-  const money = x => x == null ? "—" : "$" + x.toFixed(2);
+  const money = x => (x == null || isNaN(x)) ? "—" : "$" + Number(x).toFixed(2);
   const tvHot = dcf.tvWeight != null && dcf.tvWeight > 0.8;
-  // Shares sanity: EDGAR sometimes returns fully-diluted count (incl. all options/warrants)
-  // which inflates share count and suppresses per-share value. Flag if suspicious.
-  const sharesHigh = d && d.shares && d.price && d.shares > 0
-    ? (d.shares * d.price) > (dcf.equity * 1.5) && dcf.equity > 0
-    : false;
   const cell = (label, value, color) => React.createElement("div", { style: { display:"flex", flexDirection:"column", gap:2 } },
     React.createElement("span", { style: { fontSize:9, letterSpacing:".05em", textTransform:"uppercase", color:c.mut } }, label),
     React.createElement("span", { style: { fontSize:14, fontWeight:600, color:color||c.ink, fontVariantNumeric:"tabular-nums" } }, value));
   return React.createElement("div", { style: { border:"1px solid "+c.line, borderLeft:"3px solid "+c.gold, background:c.panel2, borderRadius:8, padding:16, marginBottom:18 } },
-    React.createElement("div", { style: { fontSize:10, letterSpacing:".12em", textTransform:"uppercase", color:c.gold, marginBottom:12 } }, "Your DCF · intrinsic value"),
-    React.createElement("div", { style: { display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(120px, 1fr))", gap:"12px 18px" } },
-      cell("Intrinsic / share (perpetuity)", money(dcf.perShare), dcf.valid?c.ink:c.mut),
-      cell("Upside vs price", dcf.valid?pct(dcf.upside):"—", dcf.valid?dcf.upside>=0?c.green:c.red:c.mut),
-      cell("Buy below (margin of safety)", money(dcf.buyBelow), c.blue),
+    React.createElement("div", { style: { fontSize:10, letterSpacing:".12em", textTransform:"uppercase", color:c.gold, marginBottom:12 } }, "Goldman-Style DCF · Bear / Base / Bull"),
+
+    // ── Scenario table ──
+    dcf.scenarios && React.createElement("div", { style: { display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:8, marginBottom:14 } },
+      [["bear","Bear",dcf.scenarioProbs&&dcf.scenarioProbs.bear], ["base","Base",dcf.scenarioProbs&&dcf.scenarioProbs.base], ["bull","Bull",dcf.scenarioProbs&&dcf.scenarioProbs.bull]].map(([k,label,prob]) => {
+        const sc = dcf.scenarios[k];
+        const col = k==="bull" ? c.green : k==="bear" ? c.red : c.gold;
+        return React.createElement("div", { key:k, style: { background:c.panel, border:"1px solid "+c.line, borderLeft:"3px solid "+col, borderRadius:6, padding:"10px 12px" } },
+          React.createElement("div", { style: { fontSize:10, color:col, textTransform:"uppercase", letterSpacing:".08em", marginBottom:6 } }, label+" ("+(prob!=null?(prob*100).toFixed(0):"-")+"%)"),
+          React.createElement("div", { style: { fontSize:18, fontWeight:700, color:col, fontVariantNumeric:"tabular-nums" } }, money(sc&&sc.perShare)),
+          React.createElement("div", { style: { fontSize:11, color:c.mut, marginTop:2 } }, sc ? (sc.upside>=0?"+":"")+pct(sc.upside)+" vs price" : "—"),
+          React.createElement("div", { style: { fontSize:10, color:c.mut, marginTop:4 } }, "FCF growth: "+(sc&&sc.growth!=null?(sc.growth*100).toFixed(0):"-")+"%/yr"));
+      })),
+
+    // ── Probability-weighted price target ──
+    dcf.wtdPerShare != null && React.createElement("div", { style: { background:c.panel, border:"1px solid "+c.line, borderRadius:6, padding:"10px 14px", marginBottom:14, display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:10 } },
+      React.createElement("div", null,
+        React.createElement("div", { style: { fontSize:9, letterSpacing:".06em", textTransform:"uppercase", color:c.mut, marginBottom:2 } }, "Probability-weighted price target"),
+        React.createElement("div", { style: { fontSize:22, fontWeight:700, color:dcf.wtdUpside>=0?c.green:c.red } }, money(dcf.wtdPerShare))),
+      React.createElement("div", { style: { textAlign:"right" } },
+        React.createElement("div", { style: { fontSize:9, letterSpacing:".06em", textTransform:"uppercase", color:c.mut, marginBottom:2 } }, "Wtd upside vs price"),
+        React.createElement("div", { style: { fontSize:18, fontWeight:700, color:dcf.wtdUpside>=0?c.green:c.red } }, (dcf.wtdUpside>=0?"+":"")+pct(dcf.wtdUpside))),
+      React.createElement("div", { style: { fontSize:10, color:c.mut, lineHeight:1.5 } }, "Bear×"+(dcf.scenarioProbs?+(dcf.scenarioProbs.bear*100).toFixed(0):25)+"% + Base×"+(dcf.scenarioProbs?+(dcf.scenarioProbs.base*100).toFixed(0):50)+"% + Bull×"+(dcf.scenarioProbs?+(dcf.scenarioProbs.bull*100).toFixed(0):25)+"%")),
+
+    // ── Summary stats ──
+    React.createElement("div", { style: { display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(120px, 1fr))", gap:"10px 18px", marginBottom:12 } },
+      cell("Base intrinsic / share", money(dcf.perShare), dcf.valid?c.ink:c.mut),
+      cell("Base upside vs price", dcf.valid?pct(dcf.upside):"—", dcf.valid?dcf.upside>=0?c.green:c.red:c.mut),
+      cell("Buy below (−20% MOS)", money(dcf.buyBelow), c.blue),
       cell("Terminal value % of EV", dcf.tvWeight!=null?pct(dcf.tvWeight,0):"—", tvHot?c.red:c.ink),
-      cell("Exit-multiple value / share", money(dcf.perShareExit), c.ink),
-      cell("Blended (perpetuity + exit)", money(dcf.perShareBlended), c.ink)),
+      cell("Exit-multiple only", money(dcf.perShareExit), c.ink),
+      cell("Perpetuity only", money(dcf.perSharePerpetuity), c.ink)),
     dcf.warns && dcf.warns.length > 0 && React.createElement("ul", { style: { margin:"12px 0 0", padding:0, listStyle:"none", display:"flex", flexDirection:"column", gap:5 } },
       dcf.warns.map((w,i) => React.createElement("li", { key:i, style: { fontSize:11.5, color:c.ink, lineHeight:1.4 } },
         React.createElement("span", { style: { color:c.gold, marginRight:6 } }, "⚠"), w))),
@@ -2872,14 +2934,23 @@ function App() {
   // DCF
   const [d, setD] = useState({
     fcf0: 100000,
-    g1: 0.12,   // 12% starting point — adjust down for slow growers, up for hypergrowth
+    g1: 0.12,
     years1: 5,
     years2: 5,
-    gt: 0.025,  // ~nominal GDP; use 0.03 for USD-centric businesses
-    wacc: 0.10, // 10% default; build precisely with CAPM below
+    gt: 0.025,
+    wacc: 0.10,
     netDebt: -50000,
     shares: 15000,
-    price: 190
+    price: 190,
+    // Goldman-style additions
+    exitMultiple: 25,    // EV/FCF exit multiple (vs perpetuity growth); 20-30x typical
+    bearG: 0.06,         // Bear case FCF growth
+    baseG: 0.12,         // Base case FCF growth (same as g1)
+    bullG: 0.20,         // Bull case FCF growth
+    bearProb: 0.25,
+    bullProb: 0.25,      // bear+bull+base probabilities must sum to 1
+    fcfMargin: 0.10,     // FCF margin (used if revenue-driven mode)
+    revenue0: 0,         // Base revenue (0 = disabled, use FCF directly)
   });
   const setDcf = k => v => setD(s => ({
     ...s,
@@ -2981,7 +3052,9 @@ function App() {
   }));
   // DCF defaults reset on every new ticker fetch so stale assumptions don't carry over
   function dcfDefaults() {
-    return { g1: 0.12, years1: 5, years2: 5, gt: 0.025 };
+    return { g1: 0.12, years1: 5, years2: 5, gt: 0.025,
+             exitMultiple: 25, bearG: 0.06, baseG: 0.12, bullG: 0.20,
+             bearProb: 0.25, bullProb: 0.25, fcfMargin: 0.10, revenue0: 0 };
   }
 
   async function fetchLive(pd = period) {
@@ -3996,10 +4069,38 @@ function App() {
     }
   }, fcfHist.map(h => `FY${String(h.fiscal_year).slice(2)} ${fmt(h.free_cash_flow / 1e9, 1)}B`).join(" · "))), /*#__PURE__*/React.createElement(Field, {
     c: c,
-    label: "High-growth rate",
+    label: "Base FCF growth",
     value: d.g1,
     onChange: setDcf("g1"),
     step: "0.005",
+    suffix: "dec"
+  }), /*#__PURE__*/React.createElement(Field, {
+    c: c,
+    label: "Bear FCF growth",
+    value: d.bearG,
+    onChange: setDcf("bearG"),
+    step: "0.005",
+    suffix: "dec"
+  }), /*#__PURE__*/React.createElement(Field, {
+    c: c,
+    label: "Bull FCF growth",
+    value: d.bullG,
+    onChange: setDcf("bullG"),
+    step: "0.005",
+    suffix: "dec"
+  }), /*#__PURE__*/React.createElement(Field, {
+    c: c,
+    label: "Bear prob",
+    value: d.bearProb,
+    onChange: setDcf("bearProb"),
+    step: "0.05",
+    suffix: "dec"
+  }), /*#__PURE__*/React.createElement(Field, {
+    c: c,
+    label: "Bull prob",
+    value: d.bullProb,
+    onChange: setDcf("bullProb"),
+    step: "0.05",
     suffix: "dec"
   }), /*#__PURE__*/React.createElement(Field, {
     c: c,
@@ -4020,6 +4121,12 @@ function App() {
     onChange: setDcf("gt"),
     step: "0.005",
     suffix: "dec"
+  }), /*#__PURE__*/React.createElement(Field, {
+    c: c,
+    label: "Exit multiple (EV/FCF)",
+    value: d.exitMultiple,
+    onChange: setDcf("exitMultiple"),
+    step: "1"
   }), /*#__PURE__*/React.createElement(Field, {
     c: c,
     label: "WACC",
